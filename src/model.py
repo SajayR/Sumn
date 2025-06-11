@@ -35,11 +35,8 @@ class AudioEmbedder(nn.Module):
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
-        
-        # Get the downsampling factor from HuBERT's feature extractor
-        # This is typically 320 for most HuBERT models (16kHz -> 50Hz)
         self.downsample_factor = self._compute_downsample_factor()
-        print(f"Downsample factor: {self.downsample_factor}")
+        #print(f"Downsample factor: {self.downsample_factor}")
         
         for param in self.hubert.parameters():
             param.requires_grad = True
@@ -206,13 +203,14 @@ class VisionEncoder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        
+        print("Dino input shape: ", x.shape)
         outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
-        patches = outputs.last_hidden_state[:,1:, :]
+        patches = outputs.last_hidden_state[:,5:, :] #5 cause 1 is the cls token, 4 are registers
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         if self.training:
             feats = self.patch_dropout(feats, self.patch_dropout_rate)
         feats = F.normalize(feats, dim=-1)
+        print("Dino output shape: ", feats.shape)
         return feats
 
 
@@ -454,4 +452,9 @@ if __name__ == "__main__":
     images = images.to("cuda")
     
     outputs = model(audio_input, images)
-    print(outputs)
+    print(outputs['visual_feats'].shape)
+    print(outputs['audio_feats'].shape)
+    print(outputs['clip_sims'].shape)
+    # print(outputs['token_sims'].shape)
+    # print(outputs['audio_attention_mask'].shape)
+    # print(outputs['loss'])
