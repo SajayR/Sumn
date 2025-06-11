@@ -24,14 +24,22 @@ class AudioEmbedder(nn.Module):
     """
     Pre-trained HuBERT to extract audio features from raw audio (16kHz).
     Projects them down to a desired embedding dimension.
+    
+    This version properly handles the attention mask downsampling that occurs
+    in HuBERT's convolutional feature extraction layers.
     """
-    def __init__(self, embedding_dim=512, hubert_name="ntu-spml/distilhubert"):
+    def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
 
-        self.projection1 = nn.Linear(self.hubert.config.hidden_size, 512)
-        self.layer_norm = nn.LayerNorm(512)
-        self.projection2 = nn.Linear(512, embedding_dim)
+        self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
+        self.layer_norm = nn.LayerNorm(256)
+        self.projection2 = nn.Linear(256, embedding_dim)
+        
+        # Get the downsampling factor from HuBERT's feature extractor
+        # This is typically 320 for most HuBERT models (16kHz -> 50Hz)
+        self.downsample_factor = self._compute_downsample_factor()
+        print(f"Downsample factor: {self.downsample_factor}")
         
         for param in self.hubert.parameters():
             param.requires_grad = True
@@ -39,23 +47,93 @@ class AudioEmbedder(nn.Module):
             param.requires_grad = True
         for param in self.projection2.parameters():
             param.requires_grad = True
+    
+    def _compute_downsample_factor(self):
+        """
+        Compute the total downsampling factor of HuBERT's feature extractor.
+        This is the product of all stride values in the convolutional layers.
+        """
+        downsample_factor = 1
+        if hasattr(self.hubert, 'feature_extractor'):
+            for layer in self.hubert.feature_extractor.conv_layers:
+                if hasattr(layer, 'conv'):
+                    downsample_factor *= layer.conv.stride[0]
+        else:
+            # Default factor for most HuBERT models
+            downsample_factor = 320
+        return downsample_factor
+    
+    def _downsample_attention_mask(self, attention_mask: torch.Tensor, target_length: int) -> torch.Tensor:
+        """
+        Downsample the attention mask to match the output sequence length.
         
-    def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
+        Args:
+            attention_mask: (B, L) input attention mask
+            target_length: desired output length
+            
+        Returns:
+            downsampled_mask: (B, target_length) output attention mask
+        """
+        if attention_mask is None:
+            return None
+            
+        batch_size = attention_mask.size(0)
+        input_length = attention_mask.size(1)
+        
+        # Method 1: Simple downsampling by taking every nth element
+        # This works well when the downsampling is uniform
+        if input_length // self.downsample_factor == target_length:
+            # Perfect match - use stride-based downsampling
+            downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
+        else:
+            # Method 2: Adaptive pooling to handle any length mismatch
+            # Reshape to (B, 1, L) for adaptive pooling
+            mask_float = attention_mask.float().unsqueeze(1)
+            
+            # Use adaptive average pooling to downsample
+            downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
+            
+            # Convert back to binary mask (threshold at 0.5)
+            downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
+        
+        return downsampled_mask
+        
+    def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             audio_input: (B, L) processed audio features
-            attention_mask: (B, L) attention mask for audio tokens
+            attention_mask: (B, L) attention mask for audio tokens (input length)
             
         Returns:
-            audio_feats: (B, Na, D) 
-                B = batch size
-                Na = number of audio tokens
-                D = embedding_dim
+            audio_feats: (B, Na, D) where Na is the OUTPUT sequence length
+            output_attention_mask: (B, Na) attention mask for output tokens
         """
-        hubert_output = self.hubert(audio_input, attention_mask=attention_mask).last_hidden_state
+        # Get HuBERT outputs
+        hubert_outputs = self.hubert(
+            audio_input, 
+            attention_mask=attention_mask,
+            return_dict=True
+        )
+        
+        hubert_output = hubert_outputs.last_hidden_state  # (B, Na, H)
+        output_length = hubert_output.size(1)
+        
+        # Downsample the attention mask to match output length
+        if attention_mask is not None:
+            output_attention_mask = self._downsample_attention_mask(attention_mask, output_length)
+        else:
+            # If no input mask, all outputs are valid
+            batch_size = hubert_output.size(0)
+            output_attention_mask = torch.ones(
+                batch_size, output_length,
+                dtype=torch.long,
+                device=hubert_output.device
+            )
+        
+        # Project features
         audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))
         audio_feats = F.normalize(audio_feats, dim=-1)
-        return audio_feats
+        return audio_feats, output_attention_mask
     
 class VisionEncoder(nn.Module):
 
@@ -80,12 +158,9 @@ class VisionEncoder(nn.Module):
             inference_mode=False,
             r=lora_rank,
             lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=0.1,
-            fan_in_fan_out=True,  
+            target_modules=lora_target_modules, 
             bias="none",          
             modules_to_save=None,  
-            
         )
 
         self.model = get_peft_model(self.model, lora_config)
@@ -151,12 +226,12 @@ class VeS(nn.Module):
 
         self.visual_embedder = VisionEncoder()  
         self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
-        self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
 
         self.audio_embedder = AudioEmbedder()
+        self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
-        
         self.use_amp = use_amp
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.amp_dtype = torch.bfloat16
         
     def process_audio(self, audio_input: torch.Tensor):
@@ -170,11 +245,14 @@ class VeS(nn.Module):
             processed_audio: processed audio tensor
             attention_mask: (B, L) attention mask for audio tokens
         """
-        if len(audio_input.shape) == 3:
-            audio_input = audio_input.squeeze(0)
-            
+        # Convert batched tensor to list of 1D arrays for the processor
+        if len(audio_input.shape) == 2:  # (B, T)
+            audio_list = [audio_input[i].cpu().numpy() for i in range(audio_input.shape[0])]
+        else:  # Handle other cases
+            audio_list = audio_input.cpu().numpy()
+        
         processed = self.audio_processor(
-            audio_input, 
+            audio_list, 
             return_tensors="pt",
             sampling_rate=16000,
             padding=True,
@@ -186,6 +264,8 @@ class VeS(nn.Module):
         attention_mask = processed.attention_mask.to(device)
         
         return processed_audio, attention_mask
+    
+
     
     def process_image(self, images):
         """
@@ -220,25 +300,31 @@ class VeS(nn.Module):
         """
         # Process raw inputs
         processed_audio, audio_attention_mask = self.process_audio(audio_input)
-        pixel_values = self.process_image(images)
+
+        if isinstance(images, torch.Tensor):
+            # Move to correct device and dtype for raw tensor inputs
+            device = next(self.parameters()).device
+            pixel_values = images.to(device)
+        else:
+            pixel_values = self.process_image(images)
 
         if self.use_amp:
-            with autocast(dtype=self.amp_dtype):
-                audio_feats = self.audio_embedder(processed_audio, audio_attention_mask)
+            with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                audio_feats, attention_mask = self.audio_embedder(processed_audio, audio_attention_mask)
                 visual_feats = self.visual_embedder(pixel_values)
                 clip_sims, token_sims = self.compute_all_similarities_tv(
                     audio_feats, 
                     visual_feats, 
-                    audio_attention_mask
+                    attention_mask
                 )
                 loss = self.compute_contrastive_loss_tv(clip_sims, token_sims)
         else:
-            audio_feats = self.audio_embedder(processed_audio, audio_attention_mask)
+            audio_feats, attention_mask = self.audio_embedder(processed_audio, audio_attention_mask)
             visual_feats = self.visual_embedder(pixel_values)
             clip_sims, token_sims = self.compute_all_similarities_tv(
                 audio_feats, 
                 visual_feats, 
-                audio_attention_mask
+                attention_mask
             )
             loss = self.compute_contrastive_loss_tv(clip_sims, token_sims)
         
@@ -247,7 +333,7 @@ class VeS(nn.Module):
             'clip_sims': clip_sims,
             'audio_feats': audio_feats,
             'visual_feats': visual_feats,
-            'audio_attention_mask': audio_attention_mask
+            'audio_attention_mask': attention_mask
         }
 
     def compute_similarity_matrix(self, feats1, feats2):
@@ -343,10 +429,29 @@ class VeS(nn.Module):
         return total_loss
 
 
-
+def dummy_inputs():
+    """Fixture to create dummy audio and image inputs."""
+    batch_size = 2
+    audio_seq_len = 16000 * 5  # 5 seconds of audio at 16kHz
+    
+    # Dummy audio: (B, T)
+    audio_input = torch.randn(batch_size, audio_seq_len)
+    
+    # Dummy image: list of PIL Images
+    #images = [Image.new('RGB', (224, 224)) for _ in range(batch_size)]
+    images = torch.randn(batch_size, 3, 224, 224)
+    
+    return audio_input, images
 if __name__ == "__main__":
     print("Testing VeS with random inputs...")
     model = VeS(
         use_amp=True,
     ).to("cuda")
+
+    audio_input, images = dummy_inputs()
+    # Move dummy inputs to CUDA since model is on CUDA
+    audio_input = audio_input.to("cuda")
+    images = images.to("cuda")
     
+    outputs = model(audio_input, images)
+    print(outputs)

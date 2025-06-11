@@ -28,7 +28,8 @@ def dummy_inputs():
     audio_input = torch.randn(batch_size, audio_seq_len)
     
     # Dummy image: list of PIL Images
-    images = [Image.new('RGB', (224, 224)) for _ in range(batch_size)]
+    #images = [Image.new('RGB', (224, 224)) for _ in range(batch_size)]
+    images = torch.randn(batch_size, 3, 224, 224)
     
     return audio_input, images
 
