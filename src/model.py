@@ -227,7 +227,8 @@ class VeS(nn.Module):
 
         self.audio_embedder = AudioEmbedder()
         self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
+        self.bias = nn.Parameter(torch.tensor(0.0))
         self.use_amp = use_amp
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.amp_dtype = torch.bfloat16
@@ -405,25 +406,50 @@ class VeS(nn.Module):
         l_nonneg = torch.mean(neg_sims**2)
         return l_nonneg
 
-        
-    def compute_contrastive_loss_tv(self, clip_sims, token_sims): #infonce
-        
-        B = clip_sims.shape[0]
-        labels = torch.arange(B, device=clip_sims.device)
-        
-        # audio->visual
-        log_prob_a2v = F.log_softmax(clip_sims, dim=1)
-        losses_a2v = -log_prob_a2v[torch.arange(B), labels]
+    
+    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor): #sigmoid
+        """
+        Pair-wise sigmoid contrastive loss for text-visual alignment.
+        Algorithm 1 Sigmoid loss pseudo-implementation.
+            1 # img_emb : image model embedding [n, dim]
+            2 # txt_emb : text model embedding [n, dim]
+            3 # t_prime, b : learnable temperature and bias
+            4 # n : mini-batch size
+            5
+            6 t = exp(t_prime)
+            7 zimg = l2_normalize(img_emb)
+            8 ztxt = l2_normalize(txt_emb)
+            9 logits = dot(zimg, ztxt.T) * t + b
+            10 labels = 2 * eye(n) - ones(n) # -1 with diagonal 1
+            11 l = -sum(log_sigmoid(labels * logits)) / n
 
-        # visual->audio
-        log_prob_v2a = F.log_softmax(clip_sims.t(), dim=1)
-        losses_v2a = -log_prob_v2a[torch.arange(B), labels]
+        Parameters
+        ----------
+        clip_sims : (B, B)   cosine-similarity matrix between every text in the batch
+                            and every image in the batch (higher = more similar)
+        token_sims: (B, B, Nt, Nv) token-level similarity tensor (needed only for the
+                    regularisation term carried over from the original code)
 
-        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
-        reg_loss = self.compute_regularization_losses_tv(token_sims)
+        Returns
+        -------
+        total_loss        : scalar torch tensor
+        similarity_stats  : dict of useful monitoring statistics
+        """
+        B = clip_sims.size(0)
 
-        total_loss = contrastive_loss + reg_loss
-        
+        labels = torch.full_like(clip_sims, -1.0)
+        labels.fill_diagonal_(1.0)           # positives on the main diagonal
+        logits        = clip_sims + self.bias      # broadcast learnable bias b
+        pairwise_loss = -F.logsigmoid(labels * logits).mean()
+
+        #scaling loss for bf16 stability
+        #pairwise_loss = pairwise_loss * 10
+
+        # optional regularisation (unchanged from the original implementation)
+        reg_loss   = self.compute_regularization_losses_tv(token_sims)
+
+        total_loss = pairwise_loss + reg_loss
+
         return total_loss
 
 
@@ -455,6 +481,9 @@ if __name__ == "__main__":
     print(outputs['visual_feats'].shape)
     print(outputs['audio_feats'].shape)
     print(outputs['clip_sims'].shape)
-    # print(outputs['token_sims'].shape)
-    # print(outputs['audio_attention_mask'].shape)
-    # print(outputs['loss'])
+    model.train()
+    with torch.no_grad():
+        outputs = model(audio_input, images)
+        print(outputs['visual_feats'].shape)
+        print(outputs['audio_feats'].shape)
+        print(outputs['clip_sims'].shape)

@@ -77,6 +77,7 @@ def test_forward_pass(model, dummy_inputs):
     # visual_feats
     # Shape is (B, Nv, D) - Nv is fixed for a given image size
     assert outputs['visual_feats'].shape[0] == batch_size
+    assert outputs['visual_feats'].shape[1] == 256
     assert outputs['visual_feats'].shape[2] == embedding_dim_vision
     print(f"Visual feats shape is correct (checked B, Nv, D): {outputs['visual_feats'].shape}")
 
