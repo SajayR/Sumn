@@ -1,0 +1,217 @@
+import argparse
+from io import BytesIO
+import os
+import pickle
+from functools import partial
+import numpy as np
+from datasets import load_dataset, interleave_datasets, Image
+from tqdm import tqdm
+import torch
+from torch.utils.data import IterableDataset
+from PIL import Image as PILImage
+import random
+import torchvision.transforms as transforms
+
+def build_and_save_image_index(cache_dir, index_path="image_index.pkl"):
+    image_dataset = load_dataset(
+        "ARTPARK-IISc/VAANI",
+        "images", 
+        split="train",
+        cache_dir=cache_dir,
+        num_proc=8  # ALWAYS same num_proc
+    )
+    
+    print(f"Building index for {len(image_dataset)} images...")
+    image_index = {}
+    
+    for idx, row in enumerate(tqdm(image_dataset, desc="Building index")):
+        filename = os.path.basename(row["image"]["path"])
+        image_index[filename] = idx
+    
+    with open(index_path, 'wb') as f:
+        pickle.dump(image_index, f)
+    
+    print(f"Saved {index_path}")
+    return image_index
+
+
+def process_image(image_bytes, crop_strategy="pad_square", target_size=224):
+    """
+    Args:
+        image_bytes: Raw image bytes
+        crop_strategy: One of ["stretch", "center_crop", "random_crop", "pad_square"]
+        target_size: Target size (224 for ViT)
+    
+    Returns:
+        torch.Tensor: Normalized image tensor [3, 224, 224]
+    """
+    image = PILImage.open(BytesIO(image_bytes)).convert('RGB')
+    
+    if crop_strategy == "stretch":
+        # stretch to target size
+        image = image.resize((target_size, target_size), PILImage.LANCZOS)
+        
+    elif crop_strategy == "center_crop":
+        #Center crop to square, then resize
+        width, height = image.size
+        min_dim = min(width, height)
+        left = (width - min_dim) // 2
+        top = (height - min_dim) // 2
+        right = left + min_dim
+        bottom = top + min_dim
+        image = image.crop((left, top, right, bottom))
+        image = image.resize((target_size, target_size), PILImage.LANCZOS)
+        
+    elif crop_strategy == "random_crop":
+        # Random crop to square, then resize
+        width, height = image.size
+        min_dim = min(width, height)
+        max_left = width - min_dim
+        max_top = height - min_dim
+        left = random.randint(0, max_left) if max_left > 0 else 0
+        top = random.randint(0, max_top) if max_top > 0 else 0
+        right = left + min_dim
+        bottom = top + min_dim
+        image = image.crop((left, top, right, bottom))
+        image = image.resize((target_size, target_size), PILImage.LANCZOS)
+        
+    elif crop_strategy == "pad_square":
+        # Pad to square with black, then resize
+        width, height = image.size
+        max_dim = max(width, height)
+        new_image = PILImage.new('RGB', (max_dim, max_dim), (0, 0, 0))
+        paste_x = (max_dim - width) // 2
+        paste_y = (max_dim - height) // 2
+        new_image.paste(image, (paste_x, paste_y))        
+        image = new_image.resize((target_size, target_size), PILImage.LANCZOS)
+    
+    else:
+        raise ValueError(f"Unknown crop_strategy: {crop_strategy}")
+    
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],  
+            std=[0.229, 0.224, 0.225]  
+        )
+    ])
+    
+    return transform(image)
+
+
+class VAAPairedDataset(IterableDataset):
+    
+    def __init__(self, cache_dir, index_path="image_index.pkl",
+                 crop_strategy="pad_square", target_size=224, audio_configs=None,):
+        super().__init__()
+        if audio_configs is None:
+            AUDIO_CONFIGS = ["Delhi_NewDelhi", 'WestBengal_Alipurduar', 'WestBengal_CoochBehar', 'WestBengal_DakshinDinajpur', 'WestBengal_Darjeeling', 'WestBengal_Jalpaiguri', 'WestBengal_Jhargram', 'WestBengal_Kolkata', 'WestBengal_Malda', 'WestBengal_North24Parganas', 'WestBengal_PaschimMedinipur', 'WestBengal_Purulia', 'Bihar_Araria', 'Bihar_Begusarai',]
+
+        self.crop_strategy = crop_strategy
+        self.target_size = target_size
+        
+        print("Loading image index...")
+        with open(index_path, 'rb') as f:
+            self.image_index = pickle.load(f)
+
+        print("Loading image dataset (memory-mapped)...")
+        self.image_dataset = load_dataset(
+            "ARTPARK-IISc/VAANI",
+            "images",
+            split="train", 
+            cache_dir=cache_dir,
+            num_proc=8,  
+            #keep_in_memory=False
+        ).cast_column("image", Image(decode=False))
+    
+        print(f"Loading {len(audio_configs)} audio configs in streaming mode...")
+        audio_streams = []
+        for config in audio_configs:
+            try:
+                ds = load_dataset(
+                    "ARTPARK-IISc/VAANI",
+                    config,
+                    split="train",
+                    cache_dir=cache_dir,
+                    streaming=True,
+                    #num_proc=12
+                )
+                audio_streams.append(ds)
+                print(f"✓ Loaded {config}")
+            except Exception as e:
+                print(f"✗ Failed to load {config}: {e}")
+        self.interleaved_audio = interleave_datasets(
+            audio_streams,
+            probabilities=None,  
+            seed=69
+        )
+    
+    def __iter__(self):
+        for audio_item in self.interleaved_audio:
+            img_filename = os.path.basename(audio_item["referenceImage"])
+            if img_filename not in self.image_index:
+                print(f"Warning: Image {img_filename} not found in index, skipping...")
+                continue
+            img_idx = self.image_index[img_filename]
+            image_item = self.image_dataset[img_idx]
+  
+            audio_array = audio_item["audio"]["array"].astype(np.float32)
+            sampling_rate = audio_item["audio"]["sampling_rate"]
+            max_samples = 5 * sampling_rate  # 5 secs
+            
+            if len(audio_array) > max_samples:
+                start_idx = np.random.randint(0, len(audio_array) - max_samples + 1)
+                audio_array = audio_array[start_idx:start_idx + max_samples]
+
+            image_tensor = process_image(
+                image_item["image"]['bytes'], 
+                self.crop_strategy, 
+                self.target_size
+            )
+            
+            yield {
+                "audio": audio_array,  # np.float32
+                "sampling_rate": sampling_rate,  # int
+                "image": image_tensor,  # torch.Tensor [3, 224, 224]
+            }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cache_dir", default="/home/cis/VaaniCache")
+    parser.add_argument("--build_index", action="store_true", 
+                       help="Build image index (run once)")
+    parser.add_argument("--test_loading", action="store_true",
+                       help="Test the dataset by loading a few examples")
+    args = parser.parse_args()
+    
+    index_path = "/home/cis/VaaniCache/image_index.pkl"
+    
+    if args.build_index:
+        build_and_save_image_index(args.cache_dir, index_path)
+        return
+
+    AUDIO_CONFIGS = ["Delhi_NewDelhi"]
+    #AUDIO_CONFIGS.extend(['WestBengal_Alipurduar', 'WestBengal_CoochBehar', 'WestBengal_DakshinDinajpur', 'WestBengal_Darjeeling', 'WestBengal_Jalpaiguri', 'WestBengal_Jhargram', 'WestBengal_Kolkata', 'WestBengal_Malda', 'WestBengal_North24Parganas', 'WestBengal_PaschimMedinipur', 'WestBengal_Purulia'])
+    #AUDIO_CONFIGS.extend(['Bihar_Araria', 'Bihar_Begusarai', 'Bihar_Bhagalpur', 'Bihar_Darbhanga', 'Bihar_EastChamparan', 'Bihar_Gaya', 'Bihar_Gopalganj', 'Bihar_Jahanabad', 'Bihar_Jamui', 'Bihar_Kaimur', 'Bihar_Katihar', 'Bihar_Kishanganj', 'Bihar_Lakhisarai', 'Bihar_Madhepura', 'Bihar_Muzaffarpur', 'Bihar_Patna', 'Bihar_Purnia', 'Bihar_Saharsa', 'Bihar_Samastipur', 'Bihar_Saran', 'Bihar_Sitamarhi', 'Bihar_Supaul', 'Bihar_Vaishali', 'Bihar_WestChamparan'])
+    #AUDIO_CONFIGS.extend(['Jharkhand_Deoghar', 'Jharkhand_Garhwa', 'Jharkhand_Jamtara', 'Jharkhand_Palamu', 'Jharkhand_Ranchi', 'Jharkhand_Sahebganj'])
+    #AUDIO_CONFIGS.extend(['UttarPradesh_Budaun', 'UttarPradesh_Deoria', 'UttarPradesh_Etah', 'UttarPradesh_Ghazipur', 'UttarPradesh_Gorakhpur', 'UttarPradesh_Hamirpur', 'UttarPradesh_Jalaun', 'UttarPradesh_JyotibaPhuleNagar', 'UttarPradesh_Lalitpur', 'UttarPradesh_Lucknow', 'UttarPradesh_Muzzaffarnagar', 'UttarPradesh_Saharanpur', 'UttarPradesh_Varanasi', 'Uttarakhand_TehriGarhwal', 'Uttarakhand_Uttarkashi'])
+
+    dataset = VAAPairedDataset(AUDIO_CONFIGS, args.cache_dir, index_path)
+    
+    if args.test_loading:
+
+        print("\nTesting dataset loading...")
+        for i, item in enumerate(dataset):
+            print(f"\nExample {i}:")
+            print(f"  Audio shape: {item['audio'].shape}")
+            print(f"  Sampling rate: {item['sampling_rate']}")
+            print(f"  Image: {item['image'].shape}")
+            
+            if i >= 2: 
+                break
+    
+
+if __name__ == "__main__":
+    main()

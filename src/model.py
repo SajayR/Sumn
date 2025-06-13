@@ -11,8 +11,6 @@ from transformers import (
 )
 import math
 warnings.filterwarnings("ignore")
-import torchvision.transforms as transforms
-from PIL import Image
 from torch.cuda.amp import autocast
 from peft import (
     LoraConfig, 
@@ -21,13 +19,7 @@ from peft import (
 )
 
 class AudioEmbedder(nn.Module):
-    """
-    Pre-trained HuBERT to extract audio features from raw audio (16kHz).
-    Projects them down to a desired embedding dimension.
-    
-    This version properly handles the attention mask downsampling that occurs
-    in HuBERT's convolutional feature extraction layers.
-    """
+
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
@@ -47,8 +39,7 @@ class AudioEmbedder(nn.Module):
     
     def _compute_downsample_factor(self):
         """
-        Compute the total downsampling factor of HuBERT's feature extractor.
-        This is the product of all stride values in the convolutional layers.
+        downsampling factor = product of all stride values in the convs.
         """
         downsample_factor = 1
         if hasattr(self.hubert, 'feature_extractor'):
@@ -56,7 +47,6 @@ class AudioEmbedder(nn.Module):
                 if hasattr(layer, 'conv'):
                     downsample_factor *= layer.conv.stride[0]
         else:
-            # Default factor for most HuBERT models
             downsample_factor = 320
         return downsample_factor
     
@@ -105,7 +95,6 @@ class AudioEmbedder(nn.Module):
             audio_feats: (B, Na, D) where Na is the OUTPUT sequence length
             output_attention_mask: (B, Na) attention mask for output tokens
         """
-        # Get HuBERT outputs
         hubert_outputs = self.hubert(
             audio_input, 
             attention_mask=attention_mask,
@@ -119,15 +108,13 @@ class AudioEmbedder(nn.Module):
         if attention_mask is not None:
             output_attention_mask = self._downsample_attention_mask(attention_mask, output_length)
         else:
-            # If no input mask, all outputs are valid
+            
             batch_size = hubert_output.size(0)
             output_attention_mask = torch.ones(
                 batch_size, output_length,
                 dtype=torch.long,
                 device=hubert_output.device
             )
-        
-        # Project features
         audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))
         audio_feats = F.normalize(audio_feats, dim=-1)
         return audio_feats, output_attention_mask
@@ -232,11 +219,12 @@ class VeS(nn.Module):
         self.use_amp = use_amp
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.amp_dtype = torch.bfloat16
+
+        self.tv_weight = 0.01
         
     def process_audio(self, audio_input: torch.Tensor):
         """
-        Process raw audio waveform using HuBERT processor.
-        
+ 
         Args:
             audio_input: (B, T) raw audio waveform at 16kHz
             
@@ -244,10 +232,10 @@ class VeS(nn.Module):
             processed_audio: processed audio tensor
             attention_mask: (B, L) attention mask for audio tokens
         """
-        # Convert batched tensor to list of 1D arrays for the processor
+        # batched tensor to list of 1D arrays 
         if len(audio_input.shape) == 2:  # (B, T)
             audio_list = [audio_input[i].cpu().numpy() for i in range(audio_input.shape[0])]
-        else:  # Handle other cases
+        else:  
             audio_list = audio_input.cpu().numpy()
         
         processed = self.audio_processor(
@@ -268,8 +256,6 @@ class VeS(nn.Module):
     
     def process_image(self, images):
         """
-        Process images using DINOv2 processor.
-        
         Args:
             images: PIL Image(s) or image tensors
             
@@ -281,59 +267,6 @@ class VeS(nn.Module):
         pixel_values = processed.pixel_values.to(device)
         
         return pixel_values
-
-    def forward(self, audio_input, images):
-        """
-        Forward pass of VeS model.
-        
-        Args:
-            audio_input: (B, T) raw audio waveform at 16kHz
-            images: PIL Images or preprocessed image tensors
-            
-        Returns:
-            dict containing:
-                - loss: total loss (contrastive + regularization)
-                - clip_sims: (B, B) clip-level similarity matrix
-                - audio_feats: (B, Na, D) audio features
-                - visual_feats: (B, Nv, D) visual features
-        """
-        # Process raw inputs
-        processed_audio, audio_attention_mask = self.process_audio(audio_input)
-
-        if isinstance(images, torch.Tensor):
-            # Move to correct device and dtype for raw tensor inputs
-            device = next(self.parameters()).device
-            pixel_values = images.to(device)
-        else:
-            pixel_values = self.process_image(images)
-
-        if self.use_amp:
-            with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                audio_feats, attention_mask = self.audio_embedder(processed_audio, audio_attention_mask)
-                visual_feats = self.visual_embedder(pixel_values)
-                clip_sims, token_sims = self.compute_all_similarities_tv(
-                    audio_feats, 
-                    visual_feats, 
-                    attention_mask
-                )
-                loss = self.compute_contrastive_loss_tv(clip_sims, token_sims)
-        else:
-            audio_feats, attention_mask = self.audio_embedder(processed_audio, audio_attention_mask)
-            visual_feats = self.visual_embedder(pixel_values)
-            clip_sims, token_sims = self.compute_all_similarities_tv(
-                audio_feats, 
-                visual_feats, 
-                attention_mask
-            )
-            loss = self.compute_contrastive_loss_tv(clip_sims, token_sims)
-        
-        return {
-            'loss': loss,
-            'clip_sims': clip_sims,
-            'audio_feats': audio_feats,
-            'visual_feats': visual_feats,
-            'audio_attention_mask': attention_mask
-        }
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -368,13 +301,10 @@ class VeS(nn.Module):
         token_sims : (B, B, Na, Nv)     raw token-level similarities
         """
         B = audio_feats.size(0)
-
-        # Broadcast so we can compare every text in the batch with every image
-
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
-        # Full token-level similarity tensor
+        # Full token-level sim
         token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
         token_sims = token_sims * torch.exp(self.logit_scale)       # scale by learned temp
 
@@ -397,17 +327,54 @@ class VeS(nn.Module):
 
         return clip_sims, token_sims
 
-    def compute_regularization_losses_tv(self, token_sims):
- 
-        # (B, B, Nt, Nv)
-        B = token_sims.shape[0]
-        # negative clamp
-        neg_sims = torch.clamp(token_sims, min=-20, max=0)
-        l_nonneg = torch.mean(neg_sims**2)
-        return l_nonneg
+    def compute_regularization_losses_tv(
+        self,
+        token_sims : torch.Tensor,        # (B, B, Na, Nv)
+        attn_mask  : torch.Tensor | None  # (B, Na) or None
+    ):
+        """
+        Regularisation =  l_nonneg  +  tv_weight * l_tv
+
+        • l_nonneg  — pushes all (audio-tok, visual-patch) similarities ≥ 0  
+        • l_tv      — total-variation smoothing on the *positive* pair
+                    (diagonal b → b) along the audio-token axis
+        """
+        # ----------------------------------------------------------
+        # (1) non-negativity pressure  (unchanged)
+        # ----------------------------------------------------------
+        neg_sims = token_sims.clamp(min=-20.0, max=0.0)
+        l_nonneg = neg_sims.pow(2).mean()
+
+        # Early-exit if temporal smoothing is disabled
+        if getattr(self, "tv_weight", 0.0) == 0:
+            return l_nonneg
+
+        # ----------------------------------------------------------
+        # (2) temporal-variation (TV) smoothing on the diagonal
+        # ----------------------------------------------------------
+        B = token_sims.size(0)
+        device = token_sims.device
+
+        # a2v_max[b, bʹ, t] = max over visual patches
+        a2v_max   = token_sims.max(dim=3).values            # (B, B, Na)
+        pos_trace = a2v_max[torch.arange(B, device=device),
+                            torch.arange(B, device=device)]  # (B, Na)
+
+        if attn_mask is not None:
+            m_valid   = attn_mask.float().to(device)        # (B, Na)
+            neighbour = m_valid[:, 1:] * m_valid[:, :-1]    # (B, Na-1)
+
+            diffs = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2)
+            l_tv  = (diffs * neighbour).sum() / neighbour.sum().clamp_min(1.0)
+        else:
+            l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
+
+        # ----------------------------------------------------------
+        return l_nonneg + self.tv_weight * l_tv
+
 
     
-    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor): #sigmoid
+    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
         Algorithm 1 Sigmoid loss pseudo-implementation.
@@ -446,23 +413,69 @@ class VeS(nn.Module):
         #pairwise_loss = pairwise_loss * 10
 
         # optional regularisation (unchanged from the original implementation)
-        reg_loss   = self.compute_regularization_losses_tv(token_sims)
+        reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
 
         total_loss = pairwise_loss + reg_loss
 
         return total_loss
+    
+    def forward(self, audio_input, images):
+        """
+        Forward pass of VeS model.
+        
+        Args:
+            audio_input: (B, T) raw audio waveform at 16kHz
+            images: PIL Images or preprocessed image tensors
+            
+        Returns:
+            dict containing:
+                - loss: total loss (contrastive + regularization)
+                - clip_sims: (B, B) clip-level similarity matrix
+                - audio_feats: (B, Na, D) audio features
+                - visual_feats: (B, Nv, D) visual features
+        """
+        processed_audio, raw_audio_attention_mask = self.process_audio(audio_input)
+
+        if isinstance(images, torch.Tensor):
+            device = next(self.parameters()).device
+            pixel_values = images.to(device)
+        else:
+            pixel_values = self.process_image(images)
+
+        if self.use_amp:
+            with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                audio_feats, attention_mask = self.audio_embedder(processed_audio, raw_audio_attention_mask)
+                visual_feats = self.visual_embedder(pixel_values)
+                clip_sims, token_sims = self.compute_all_similarities_tv(
+                    audio_feats, 
+                    visual_feats, 
+                    attention_mask
+                )
+                loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
+        else:
+            audio_feats, attention_mask = self.audio_embedder(processed_audio, raw_audio_attention_mask)
+            visual_feats = self.visual_embedder(pixel_values)
+            clip_sims, token_sims = self.compute_all_similarities_tv(
+                audio_feats, 
+                visual_feats, 
+                attention_mask
+            )
+            loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
+        
+        return {
+            'loss': loss,
+            'clip_sims': clip_sims,
+            'audio_feats': audio_feats,
+            'visual_feats': visual_feats,
+            'audio_attention_mask': attention_mask
+        }
 
 
 def dummy_inputs():
     """Fixture to create dummy audio and image inputs."""
     batch_size = 2
     audio_seq_len = 16000 * 5  # 5 seconds of audio at 16kHz
-    
-    # Dummy audio: (B, T)
     audio_input = torch.randn(batch_size, audio_seq_len)
-    
-    # Dummy image: list of PIL Images
-    #images = [Image.new('RGB', (224, 224)) for _ in range(batch_size)]
     images = torch.randn(batch_size, 3, 224, 224)
     
     return audio_input, images
@@ -473,7 +486,6 @@ if __name__ == "__main__":
     ).to("cuda")
 
     audio_input, images = dummy_inputs()
-    # Move dummy inputs to CUDA since model is on CUDA
     audio_input = audio_input.to("cuda")
     images = images.to("cuda")
     
