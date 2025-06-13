@@ -190,14 +190,14 @@ class VisionEncoder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
-        print("Dino input shape: ", x.shape)
+        #print("Dino input shape: ", x.shape)
         outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
         patches = outputs.last_hidden_state[:,5:, :] #5 cause 1 is the cls token, 4 are registers
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         if self.training:
             feats = self.patch_dropout(feats, self.patch_dropout_rate)
         feats = F.normalize(feats, dim=-1)
-        print("Dino output shape: ", feats.shape)
+        #print("Dino output shape: ", feats.shape)
         return feats
 
 
@@ -419,7 +419,7 @@ class VeS(nn.Module):
 
         return total_loss
     
-    def forward(self, audio_input, images):
+    def forward(self, audio_input, images, attention_mask=None):
         """
         Forward pass of VeS model.
         
@@ -434,7 +434,7 @@ class VeS(nn.Module):
                 - audio_feats: (B, Na, D) audio features
                 - visual_feats: (B, Nv, D) visual features
         """
-        processed_audio, raw_audio_attention_mask = self.process_audio(audio_input)
+        processed_audio, raw_audio_attention_mask = audio_input, attention_mask #self.process_audio(audio_input)
 
         if isinstance(images, torch.Tensor):
             device = next(self.parameters()).device

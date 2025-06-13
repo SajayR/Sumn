@@ -1,0 +1,58 @@
+# VeS Training Configuration
+training:
+  # Device and basic settings
+  device: "cuda"
+  use_amp: true
+  
+  # Data settings
+  batch_size: 32
+  num_workers: 0
+  
+  # Training schedule
+  num_epochs: 10
+  steps_per_epoch: 1000
+  
+  # Optimization
+  learning_rate: 1e-4
+  gradient_accumulation_steps: 1
+  
+  # Checkpointing
+  output_dir: "checkpoints"
+  checkpoint_every_steps: 2000
+
+# Model configuration
+model:
+  use_amp: true
+  
+# Data configuration
+data:
+  cache_dir: "/home/cis/VaaniCache"
+  index_path: "/home/cis/VaaniCache/image_index.pkl"
+  crop_strategy: "pad_square"
+  target_size: 224
+  audio_configs:
+    - "Delhi_NewDelhi"
+    #- "WestBengal_Alipurduar"
+   # - "WestBengal_CoochBehar"
+   # - "WestBengal_DakshinDinajpur"
+    #- "WestBengal_Darjeeling"
+    #- "WestBengal_Jalpaiguri"
+   # - "WestBengal_Jhargram"
+   ## - "WestBengal_Kolkata"
+   # - "WestBengal_Malda"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  log_file: "training.log"
+
+# Weights & Biases configuration
+wandb:
+  enabled: false
+  project: "ves-audio-visual"
+  name: null  # If null, wandb will auto-generate a name
+  tags: ["audio-visual", "multimodal"]
+  notes: "VeS model training with VAANI dataset"
+  log_freq: 1  # Log metrics every N steps
+  watch_model: true  # Watch model gradients and parameters
+
