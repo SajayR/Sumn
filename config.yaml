@@ -10,15 +10,18 @@ training:
   
   # Training schedule
   num_epochs: 10
-  steps_per_epoch: 1000
+  steps_per_epoch: 100000
   
   # Optimization
-  learning_rate: 1e-4
+  learning_rate: 2e-1
   gradient_accumulation_steps: 1
   
   # Checkpointing
   output_dir: "checkpoints"
   checkpoint_every_steps: 2000
+
+  viz_every_steps: 1000
+  viz_batch_limit: 32
 
 # Model configuration
 model:
@@ -27,12 +30,12 @@ model:
 # Data configuration
 data:
   cache_dir: "/home/cis/VaaniCache"
-  index_path: "/home/cis/VaaniCache/image_index.pkl"
+  index_path: "/home/cis/CisStuff/VeS/image_index.pkl"
   crop_strategy: "pad_square"
   target_size: 224
   audio_configs:
     - "Delhi_NewDelhi"
-    #- "WestBengal_Alipurduar"
+   # - "WestBengal_Alipurduar"
    # - "WestBengal_CoochBehar"
    # - "WestBengal_DakshinDinajpur"
     #- "WestBengal_Darjeeling"

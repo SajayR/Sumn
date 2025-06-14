@@ -461,13 +461,14 @@ class VeS(nn.Module):
                 attention_mask
             )
             loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
-        
+        #print(token_sims.shape)
         return {
             'loss': loss,
-            'clip_sims': clip_sims,
-            'audio_feats': audio_feats,
-            'visual_feats': visual_feats,
-            'audio_attention_mask': attention_mask
+            'clip_sims': clip_sims.detach(),
+            'audio_feats': audio_feats.detach(),
+            'visual_feats': visual_feats.detach(),
+            'audio_attention_mask': attention_mask.detach(),
+            'token_sims': token_sims.detach()
         }
 
 

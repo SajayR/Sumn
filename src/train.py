@@ -1,3 +1,5 @@
+#### train.py ####
+
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
@@ -18,6 +20,9 @@ from pathlib import Path
 import yaml
 import argparse
 import time
+import bitsandbytes as bnb
+from splus import SPlus
+from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
 
@@ -86,9 +91,20 @@ class VeSTrainer:
         self.gradient_accumulation      = self.cfg_train.get("gradient_accumulation_steps", 1)
         self.checkpoint_every_steps     = self.cfg_train.get("checkpoint_every_steps", 2000)
         self.learning_rate              = self.cfg_train.get("learning_rate", 1e-4)
+        self.visualize_every_steps      = self.cfg_train.get("visualize_every_steps", 10)
+        self.viz_every_steps            = self.cfg_train.get("viz_every_steps", 10)
 
         self.output_dir = Path(self.cfg_train.get("output_dir", "checkpoints"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.vis_out_dir = self.output_dir / "visualizations"
+        self.vis_out_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize visualizer
+        self.visualizer = VeSVisualizer(
+            out_dir=self.output_dir / "viz",
+            fps=25,
+            max_samples_per_call=self.cfg_train.get("viz_batch_limit", 4),
+        )
         
         # ----------------------------- wandb -------------------------------
         self.use_wandb = self.cfg_wandb.get("enabled", False)
@@ -109,7 +125,14 @@ class VeSTrainer:
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         print("Initializing dataset...get ready bitches")
 
-        dataset = VAAPairedDataset()
+        # Get data configuration
+        self.cfg_data = config.get("data", {})
+        dataset = VAAPairedDataset(
+            index_path=self.cfg_data.get("index_path", "/home/cis/CisStuff/VeS/image_index.pkl"),
+            crop_strategy=self.cfg_data.get("crop_strategy", "pad_square"),
+            target_size=self.cfg_data.get("target_size", 224),
+            audio_configs=self.cfg_data.get("audio_configs", None)
+        )
 
         self.dataloader = DataLoader(
             dataset,
@@ -124,7 +147,8 @@ class VeSTrainer:
         self.model = VeS(use_amp=self.cfg_train.get("use_amp", True)).to(self.device)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
-
+        #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
+        self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
         #total_steps = self.num_epochs * self.steps_per_epoch
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
@@ -193,6 +217,7 @@ class VeSTrainer:
 
     def train(self):
         for epoch in range(self.num_epochs):
+            self.optimizer.train()
             self.model.train()
             epoch_losses = []
             steps_per_epoch = len(self.dataloader)
@@ -209,9 +234,9 @@ class VeSTrainer:
 
                 outputs = self.model(audio, images, attention_mask=batch["attention_mask"].to(self.device))
                 loss    = outputs["loss"] / self.gradient_accumulation
-                if step % 100 == 0:
-                    print(outputs['audio_feats'].shape)
-                    print(outputs['visual_feats'].shape)
+                #if step % 100 == 0:
+                 #   print(outputs['audio_feats'].shape)
+                #    print(outputs['visual_feats'].shape)
                 loss.backward()
                 
                 accumulation_counter += 1
@@ -221,6 +246,18 @@ class VeSTrainer:
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+
+                # ---------------------------------------------------------
+                #   periodic visualisation
+                # ---------------------------------------------------------
+                if self.global_step % self.viz_every_steps == 0:
+                    self.visualizer.visualize_batch(
+                        batch,                         # still on CPU for everything but image
+                        #{k: (v.detach() if torch.is_tensor(v) else v)
+                          #  for k, v in outputs.items()},
+                        outputs,
+                        step=self.global_step,
+                    )
 
                 loss_val = loss.item() * self.gradient_accumulation
                 epoch_losses.append(loss_val)
