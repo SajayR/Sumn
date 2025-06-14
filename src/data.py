@@ -132,10 +132,13 @@ class VAAPairedDataset(IterableDataset):
                     "ARTPARK-IISc/VAANI",
                     config,
                     split="train",
+                    #streaming=True,
+                    download_mode="reuse_dataset_if_exists",
                     #cache_dir=cache_dir,
                     #streaming=True,
                     #num_proc=12
                 )
+                ds = ds.remove_columns("transcript") 
                 audio_streams.append(ds)
                 print(f"✓ Loaded {config}")
             except Exception as e:

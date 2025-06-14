@@ -220,7 +220,7 @@ class VeS(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.amp_dtype = torch.bfloat16
 
-        self.tv_weight = 0.01
+        self.tv_weight = 0.0001
         
     def process_audio(self, audio_input: torch.Tensor):
         """

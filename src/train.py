@@ -140,7 +140,7 @@ class VeSTrainer:
             collate_fn=make_vaani_collate_fn(self.processor),
             num_workers=self.cfg_train.get("num_workers", 4),
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=False,
             drop_last=True,
         )
         print("pffft aight")
@@ -148,12 +148,12 @@ class VeSTrainer:
         # ----------------------------- model/optim -------------------------
         self.model = VeS(use_amp=self.cfg_train.get("use_amp", True)).to(self.device)
 
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
+        #self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
         self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
         
         # Calculate total steps for cosine schedule with warmup
-        total_steps = self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
+        total_steps = len(self.dataloader)#self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
         warmup_steps = int(self.cfg_train.get("warmup_ratio", 0.1) * total_steps)
         
         self.scheduler = get_cosine_schedule_with_warmup(

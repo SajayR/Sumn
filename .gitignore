@@ -7,5 +7,5 @@ htmlcov/
 /fuckaround
 /wandb
 /src/splus.py
-/src/utils/
 /checkpoints
+image_index.pkl

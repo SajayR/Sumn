@@ -41,7 +41,7 @@ data:
     - "WestBengal_DakshinDinajpur"
     - "WestBengal_Darjeeling"
     - "WestBengal_Jalpaiguri"
-    - "WestBengal_Jhargram"
+    #- "WestBengal_Jhargram"
     - "WestBengal_Kolkata"
     - "WestBengal_Malda"
     - "WestBengal_North24Parganas"
