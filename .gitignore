@@ -5,3 +5,7 @@ __pycache__/
 .coverage
 htmlcov/
 /fuckaround
+/wandb
+/src/splus.py
+/src/utils/
+/checkpoints

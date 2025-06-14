@@ -6,15 +6,16 @@ training:
   
   # Data settings
   batch_size: 32
-  num_workers: 0
+  num_workers: 4
   
   # Training schedule
-  num_epochs: 10
+  num_epochs: 4
   steps_per_epoch: 100000
   
   # Optimization
   learning_rate: 2e-1
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
+  warmup_ratio: 0.1  # 10% of total steps for warmup
   
   # Checkpointing
   output_dir: "checkpoints"
@@ -35,14 +36,39 @@ data:
   target_size: 224
   audio_configs:
     - "Delhi_NewDelhi"
-   # - "WestBengal_Alipurduar"
-   # - "WestBengal_CoochBehar"
-   # - "WestBengal_DakshinDinajpur"
-    #- "WestBengal_Darjeeling"
-    #- "WestBengal_Jalpaiguri"
-   # - "WestBengal_Jhargram"
-   ## - "WestBengal_Kolkata"
-   # - "WestBengal_Malda"
+    - "WestBengal_Alipurduar"
+    - "WestBengal_CoochBehar"
+    - "WestBengal_DakshinDinajpur"
+    - "WestBengal_Darjeeling"
+    - "WestBengal_Jalpaiguri"
+    - "WestBengal_Jhargram"
+    - "WestBengal_Kolkata"
+    - "WestBengal_Malda"
+    - "WestBengal_North24Parganas"
+    - "WestBengal_PaschimMedinipur"
+    - "WestBengal_Purulia"
+    - "Bihar_Araria"
+    - "Bihar_Begusarai"
+    - "Bihar_Bhagalpur"
+    - "Bihar_Darbhanga"
+    - "Bihar_EastChamparan"
+    - "Bihar_Gaya"
+    - "Bihar_Gopalganj"
+    - "Bihar_Jahanabad"
+    - "Bihar_Jamui"
+    - "Bihar_Kaimur"
+    - "Bihar_Katihar"
+    - "Bihar_Kishanganj"
+    - "Bihar_Lakhisarai"
+    - "Bihar_Madhepura"
+    - "Bihar_Muzaffarpur"
+    - "Bihar_Patna"
+    - "Bihar_Purnia"
+    - "Bihar_Saharsa"
+    - "Bihar_Samastipur"
+    - "Bihar_Saran"
+    - "Bihar_Sitamarhi"
+    - "Bihar_Supaul"
 
 # Logging configuration
 logging:
@@ -51,11 +77,11 @@ logging:
 
 # Weights & Biases configuration
 wandb:
-  enabled: false
-  project: "ves-audio-visual"
-  name: null  # If null, wandb will auto-generate a name
+  enabled: true
+  project: "VeS"
+  name: splus_initial_run  # If null, wandb will auto-generate a name
   tags: ["audio-visual", "multimodal"]
   notes: "VeS model training with VAANI dataset"
   log_freq: 1  # Log metrics every N steps
-  watch_model: true  # Watch model gradients and parameters
+  watch_model: false  # Watch model gradients and parameters
 

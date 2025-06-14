@@ -78,6 +78,10 @@ class VeSVisualizer:
         attn_mask: torch.Tensor,         # (Na,)        cpu tensor
     ):
         rgb_base = self._unnormalise(image_t)               # uint8 RGB
+        
+        # Double the size - hardcoded 2x scaling
+        original_H, original_W, _ = rgb_base.shape
+        rgb_base = cv2.resize(rgb_base, (original_W * 2, original_H * 2), interpolation=cv2.INTER_CUBIC)
         H, W, _ = rgb_base.shape
 
         valid_tok = int(attn_mask.sum().item())
@@ -95,15 +99,16 @@ class VeSVisualizer:
 
         # ---- video frames ----
         for t in tok_ids:
-            heat = self._sim_to_heatmap(token_sims[t])
+            # Generate heatmap at double size
+            heat = self._sim_to_heatmap(token_sims[t], size=H)  # Use doubled height as size
             frame_np = self._blend(rgb_base, heat)
 
-            #   (optional) tiny timestamp bottom-left
+            #   (optional) tiny timestamp bottom-left - scale text size for larger video
             ts = t / valid_tok * duration
             cv2.putText(
                 frame_np, f"{ts:5.2f}s",
-                (5, H - 8), cv2.FONT_HERSHEY_SIMPLEX,
-                0.4, (255, 255, 255), 1, cv2.LINE_AA,
+                (10, H - 16), cv2.FONT_HERSHEY_SIMPLEX,  # Scale position and size
+                0.8, (255, 255, 255), 2, cv2.LINE_AA,    # Scale font size and thickness
             )
             frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
             for pkt in vstream.encode(frame):

@@ -10,7 +10,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 from model import VeS
 from data import VAAPairedDataset
-from transformers import AutoProcessor
+from transformers import AutoProcessor, get_cosine_schedule_with_warmup
 import numpy as np
 import matplotlib.pyplot as plt
 import psutil
@@ -140,6 +140,8 @@ class VeSTrainer:
             collate_fn=make_vaani_collate_fn(self.processor),
             num_workers=self.cfg_train.get("num_workers", 4),
             pin_memory=True,
+            persistent_workers=True,
+            drop_last=True,
         )
         print("pffft aight")
         
@@ -149,13 +151,20 @@ class VeSTrainer:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
         self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
-        #total_steps = self.num_epochs * self.steps_per_epoch
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        
+        # Calculate total steps for cosine schedule with warmup
+        total_steps = self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
+        warmup_steps = int(self.cfg_train.get("warmup_ratio", 0.1) * total_steps)
+        
+        self.scheduler = get_cosine_schedule_with_warmup(
             self.optimizer,
-            T_0=20000, 
-            T_mult=2,
-            eta_min=1e-6
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
+            num_cycles=0.5,  # Half cosine cycle
+            last_epoch=-1
         )
+        
+        print(f"Scheduler setup: {total_steps} total steps, {warmup_steps} warmup steps")
 
         # ----------------------------- misc --------------------------------
         self.global_step = 0
@@ -191,6 +200,20 @@ class VeSTrainer:
         
         self.logger.info("Initialized wandb logging")
 
+    def compute_gradient_norm(self):
+        """Compute the gradient norm for monitoring training stability."""
+        total_norm = 0.0
+        param_count = 0
+        
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                param_norm = param.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+                param_count += 1
+        
+        total_norm = total_norm ** (1. / 2) if param_count > 0 else 0.0
+        return total_norm, param_count
+
     # -------------------------------------------------------------------------
     # Check-pointing helpers
     # -------------------------------------------------------------------------
@@ -224,7 +247,13 @@ class VeSTrainer:
             pbar = tqdm(enumerate(self.dataloader), total=steps_per_epoch, desc=f"Epoch {epoch}")
 
             accumulation_counter = 0
-
+            print("\n=== LoRA Parameter Verification ===")
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    print(f"TRAINABLE: {name} - {param.numel():,} params")
+                elif 'lora_' in name:
+                    print(f"WARNING: LoRA param not trainable: {name}")
+            print("=== End Verification ===\n")
             for step, batch in pbar:
                 if step >= self.steps_per_epoch:
                     break  # bound the epoch length for IterableDataset
@@ -234,18 +263,27 @@ class VeSTrainer:
 
                 outputs = self.model(audio, images, attention_mask=batch["attention_mask"].to(self.device))
                 loss    = outputs["loss"] / self.gradient_accumulation
-                #if step % 100 == 0:
-                 #   print(outputs['audio_feats'].shape)
-                #    print(outputs['visual_feats'].shape)
+
                 loss.backward()
                 
                 accumulation_counter += 1
 
                 if accumulation_counter % self.gradient_accumulation == 0:
+                    # Compute gradient norm before clipping for monitoring
+                    grad_norm, param_count = self.compute_gradient_norm()
+                    
+                    # Clip gradients
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
+                    
+                    # Log gradient norm to wandb
+                    if self.use_wandb and self.global_step % self.cfg_wandb.get("log_freq", 10) == 0:
+                        wandb.log({
+                            "gradients/grad_norm": grad_norm,
+                            "gradients/param_count": param_count,
+                        }, step=self.global_step)
 
                 # ---------------------------------------------------------
                 #   periodic visualisation
@@ -265,9 +303,10 @@ class VeSTrainer:
 
                 # Log to wandb
                 if self.use_wandb and self.global_step % self.cfg_wandb.get("log_freq", 10) == 0:
+                    current_lr = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else self.learning_rate
                     wandb.log({
                         "train/loss": loss_val,
-                        "train/learning_rate": self.scheduler.get_last_lr()[0],
+                        "train/learning_rate": current_lr,
                         "train/epoch": epoch,
                         "train/step": self.global_step,
                     }, step=self.global_step)
