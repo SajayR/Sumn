@@ -20,9 +20,10 @@ from peft import (
 
 class AudioEmbedder(nn.Module):
 
-    def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
+    def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert", freeze_hubert_initially=True):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
+        self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
@@ -30,12 +31,23 @@ class AudioEmbedder(nn.Module):
         self.downsample_factor = self._compute_downsample_factor()
         #print(f"Downsample factor: {self.downsample_factor}")
         
+        # Initially freeze HuBERT parameters if requested (for staged training)
+        self.hubert_frozen = freeze_hubert_initially
         for param in self.hubert.parameters():
-            param.requires_grad = True
+            param.requires_grad = not freeze_hubert_initially
+            
+        # Projection layers are always trainable from the start
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
             param.requires_grad = True
+        for param in self.layer_norm.parameters():
+            param.requires_grad = True
+            
+        if freeze_hubert_initially:
+            print(f"AudioEmbedder initialized with HuBERT FROZEN")
+        else:
+            print(f"AudioEmbedder initialized with HuBERT UNFROZEN")
     
     def _compute_downsample_factor(self):
         """
@@ -119,12 +131,24 @@ class AudioEmbedder(nn.Module):
         audio_feats = F.normalize(audio_feats, dim=-1)
         return audio_feats, output_attention_mask
     
+    def unfreeze_hubert(self):
+        """Unfreeze HuBERT parameters for fine-tuning after warmup period."""
+        if self.hubert_frozen:
+            print("Unfreezing HuBERT parameters...")
+            for param in self.hubert.parameters():
+                param.requires_grad = True
+            self.hubert_frozen = False
+            print(f"HuBERT parameters unfrozen. Total trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
+        else:
+            print("HuBERT parameters are already unfrozen")
+
 class VisionEncoder(nn.Module):
 
     def __init__(self, embedding_dim=256, patch_dropout_prob=0.1, lora_rank=16, lora_alpha=32):
         super().__init__()
 
         self.model = AutoModel.from_pretrained('facebook/dinov2-with-registers-base')
+        self.model.gradient_checkpointing_enable()
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -208,13 +232,14 @@ class VisionEncoder(nn.Module):
 class VeS(nn.Module):
     def __init__(
         self, 
+        freeze_hubert_initially=True,
     ):
         super().__init__()
 
         self.visual_embedder = VisionEncoder()  
         self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
 
-        self.audio_embedder = AudioEmbedder()
+        self.audio_embedder = AudioEmbedder(freeze_hubert_initially=freeze_hubert_initially)
         self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
         self.bias = nn.Parameter(torch.tensor(0.0))
@@ -404,6 +429,9 @@ class VeS(nn.Module):
             'token_sims': token_sims.detach()
         }
 
+    def unfreeze_hubert(self):
+        """Unfreeze HuBERT encoder for second stage of training."""
+        self.audio_embedder.unfreeze_hubert()
 
 def dummy_inputs():
     """Fixture to create dummy audio and image inputs."""
@@ -415,21 +443,35 @@ def dummy_inputs():
     return audio_input, images
 if __name__ == "__main__":
     print("Testing VeS with random inputs...")
-    model = VeS(
-        use_amp=True,
-    ).to("cuda")
+    
+    # Test with staged training (HuBERT frozen initially)
+    print("\n=== Testing with HuBERT frozen (Stage 1) ===")
+    model = VeS(freeze_hubert_initially=True).to("cuda")
 
     audio_input, images = dummy_inputs()
     audio_input = audio_input.to("cuda")
     images = images.to("cuda")
     
+    # Count trainable params before unfreezing
+    trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params (Stage 1): {trainable_before:,}")
+    
     outputs = model(audio_input, images)
-    print(outputs['visual_feats'].shape)
-    print(outputs['audio_feats'].shape)
-    print(outputs['clip_sims'].shape)
+    print(f"Visual features shape: {outputs['visual_feats'].shape}")
+    print(f"Audio features shape: {outputs['audio_feats'].shape}")
+    print(f"Clip similarities shape: {outputs['clip_sims'].shape}")
+    
+    # Test unfreezing
+    print("\n=== Testing HuBERT unfreezing (Stage 2) ===")
+    model.unfreeze_hubert()
+    
+    trainable_after = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable params (Stage 2): {trainable_after:,}")
+    print(f"Newly unfrozen params: {trainable_after - trainable_before:,}")
+    
     model.train()
     with torch.no_grad():
         outputs = model(audio_input, images)
-        print(outputs['visual_feats'].shape)
-        print(outputs['audio_feats'].shape)
-        print(outputs['clip_sims'].shape)
+        print(f"Visual features shape: {outputs['visual_feats'].shape}")
+        print(f"Audio features shape: {outputs['audio_feats'].shape}")
+        print(f"Clip similarities shape: {outputs['clip_sims'].shape}")

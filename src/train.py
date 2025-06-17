@@ -59,6 +59,7 @@ class VeSTrainer:
         self.learning_rate              = self.cfg_train.get("learning_rate", 1e-4)
         self.visualize_every_steps      = self.cfg_train.get("visualize_every_steps", 10)
         self.viz_every_steps            = self.cfg_train.get("viz_every_steps", 10)
+        self.hubert_unfreeze_steps      = self.cfg_train.get("hubert_unfreeze_steps", None)
 
         self.output_dir = Path(self.cfg_train.get("output_dir", "checkpoints"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +88,11 @@ class VeSTrainer:
 
         if self.use_wandb:
             self._init_wandb(config)
+            # Log initial training stage
+            wandb.log({
+                "train/stage": 1 if freeze_hubert else 0,  # Stage 1: LoRA + projections only, Stage 0: all trainable
+                "train/hubert_unfrozen": 0 if freeze_hubert else 1,
+            }, step=0)
 
         # ----------------------------- data --------------------------------
         #self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
@@ -104,14 +110,21 @@ class VeSTrainer:
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
+            prefetch_factor=6,
         )
         print("pffft aight")
         
         # ----------------------------- model/optim -------------------------
-        self.model = VeS().to(self.device)
+        # Initialize model with staged training if configured
+        freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
+        self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
         self.model.visual_embedder.fuse_lora()
         #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
         self.model.train()
+        
+        # Track if we've unfrozen HuBERT
+        self.hubert_unfrozen = not freeze_hubert
+        
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
         #self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
@@ -198,11 +211,45 @@ class VeSTrainer:
         temp.rename(self._ckpt_path(epoch, step))
         self.logger.info(f"Saved checkpoint – epoch {epoch}, step {step}")
 
+    def print_trainable_params(self, stage_name=""):
+        """Print current trainable parameter status for debugging staged training."""
+        print(f"\n=== Trainable Parameter Status {stage_name} ===")
+        
+        # Count parameters by component
+        audio_hubert_params = sum(p.numel() for n, p in self.model.audio_embedder.hubert.named_parameters() if p.requires_grad)
+        audio_proj_params = sum(p.numel() for n, p in self.model.audio_embedder.named_parameters() 
+                               if p.requires_grad and 'hubert' not in n)
+        
+        vision_base_params = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() 
+                                if p.requires_grad and 'lora_' not in n)
+        vision_lora_params = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() 
+                                if p.requires_grad and 'lora_' in n)
+        vision_proj_params = sum(p.numel() for n, p in self.model.visual_embedder.named_parameters() 
+                                if p.requires_grad and 'model' not in n)
+        
+        other_params = sum(p.numel() for n, p in self.model.named_parameters() 
+                          if p.requires_grad and 'audio_embedder' not in n and 'visual_embedder' not in n)
+        
+        total_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.model.parameters())
+        
+        print(f"Audio HuBERT: {audio_hubert_params:,} params {'(TRAINABLE)' if audio_hubert_params > 0 else '(FROZEN)'}")
+        print(f"Audio Projections: {audio_proj_params:,} params (TRAINABLE)")
+        print(f"Vision Base Model: {vision_base_params:,} params {'(WARNING: SHOULD BE FROZEN!)' if vision_base_params > 0 else '(FROZEN)'}")
+        print(f"Vision LoRA: {vision_lora_params:,} params (TRAINABLE)")
+        print(f"Vision Projections: {vision_proj_params:,} params (TRAINABLE)")
+        print(f"Other (logit_scale, bias): {other_params:,} params (TRAINABLE)")
+        print(f"Total Trainable: {total_trainable:,} / {total_params:,} ({100 * total_trainable / total_params:.2f}%)")
+        print("=== End Status ===\n")
+
     # -------------------------------------------------------------------------
     # Training loop
     # -------------------------------------------------------------------------
 
     def train(self):
+        # Print initial parameter status
+        self.print_trainable_params("(Initial State)")
+        
         for epoch in range(self.num_epochs):
             #self.optimizer.train()
 
@@ -221,6 +268,40 @@ class VeSTrainer:
             for step, batch in pbar:
                 if step >= self.steps_per_epoch:
                     break  # bound the epoch length for IterableDataset
+
+                # Check if we need to unfreeze HuBERT
+                if (not self.hubert_unfrozen and 
+                    self.hubert_unfreeze_steps is not None and 
+                    self.global_step >= self.hubert_unfreeze_steps):
+                    
+                    print(f"\n Reached step {self.global_step} - Unfreezing HuBERT encoder!")
+                    self.model.unfreeze_hubert()
+                    
+                    # Recreate optimizer with newly unfrozen parameters
+                    old_lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else self.learning_rate
+                    self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(old_lr))
+                    
+                    # Recreate scheduler with the same state
+                    total_steps = self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
+                    warmup_steps = int(self.cfg_train.get("warmup_ratio", 0.1) * total_steps)
+                    self.scheduler = get_cosine_schedule_with_warmup(
+                        self.optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=total_steps,
+                        num_cycles=0.5,
+                        last_epoch=self.global_step - 1  # Continue from current step
+                    )
+                    
+                    self.hubert_unfrozen = True
+                    self.print_trainable_params("(After HuBERT Unfreezing)")
+                    self.logger.info(f"Unfroze HuBERT at step {self.global_step}")
+                    
+                    # Log to wandb
+                    if self.use_wandb:
+                        wandb.log({
+                            "train/hubert_unfrozen": 1,
+                            "train/stage": 2,  # Stage 2: Full model training
+                        }, step=self.global_step)
 
                 audio  = batch["audio"].to(self.device)
                 images = batch["image"].to(self.device)

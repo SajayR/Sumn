@@ -16,6 +16,7 @@ training:
   learning_rate: 3e-4
   gradient_accumulation_steps: 4
   warmup_ratio: 0.1  # 10% of total steps for warmup
+  hubert_unfreeze_steps: 5000  # Number of steps before unfreezing HuBERT encoder
   
   # Checkpointing
   output_dir: "checkpoints"
