@@ -8,7 +8,7 @@ from tqdm import tqdm
 import wandb
 import torch.nn as nn
 import torchvision.transforms as transforms
-from model import VeS, _encode_representations, _loss_on_reprs, _run_audio_backward, _run_vision_backward
+from model import VeS, _encode_representations, _loss_on_reprs, _run_audio_backward, _run_vision_backward, _clip_sims_blockwise
 from data import VAAPairedDataset
 from transformers import AutoProcessor, get_cosine_schedule_with_warmup
 import numpy as np
@@ -89,7 +89,7 @@ class VeSTrainer:
             pin_memory=True,
             persistent_workers=False,
             drop_last=True,
-            prefetch_factor=6,
+            prefetch_factor=4,
         )
         self.steps_per_epoch = len(self.dataloader)
         
@@ -103,7 +103,6 @@ class VeSTrainer:
         
         # Track if we've unfrozen HuBERT
         self.hubert_unfrozen = not freeze_hubert
-
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
@@ -124,7 +123,21 @@ class VeSTrainer:
         print(f"Scheduler setup: {total_steps} total steps, {warmup_steps} warmup steps")
 
         # ----------------------------- misc --------------------------------
+        # -------------------------------------------------------------
+        # Auto-resume: look for an existing checkpoint to resume from
+        # -------------------------------------------------------------
+
+        self.start_epoch = 0          # epoch to start / resume from
+        self.start_step_in_epoch = 0  # "step" offset within current epoch
+
         self.global_step = 0
+
+        if self.cfg_train.get("auto_resume", True):
+            latest_ckpt = self._find_latest_checkpoint()
+            if latest_ckpt is not None:
+                self._load_checkpoint(latest_ckpt)
+
+        # keep track of best loss seen so far (not currently used)
         self.best_loss   = float("inf")
         if self.use_wandb:
             self._init_wandb(config)
@@ -234,11 +247,15 @@ class VeSTrainer:
     # -------------------------------------------------------------------------
 # VeSTrainer.train  —  Grad-Cache edition
 # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+#                         Grad-Cache TRAIN LOOP
+# ---------------------------------------------------------------------------
     def train(self):
-        # ----------------------------------------------------- boiler-plate
         self.print_trainable_params("(Initial State)")
 
-        micro_bs = self.cfg_train.get("micro_batch_size", 32)
+        micro_bs  = self.cfg_train.get("micro_batch_size", 32)
+        encode_bs = self.cfg_train.get("encode_micro_bs", micro_bs)
+        blk_pairs = self.cfg_train.get("pair_block", 32)      # for _clip_sims_blockwise
 
         for epoch in range(self.num_epochs):
             epoch_losses = []
@@ -247,115 +264,163 @@ class VeSTrainer:
                 desc=f"Epoch {epoch}"
             )
 
-            # ------------------------------------------------- forward loop
             for step, batch in pbar:
-                if step >= self.steps_per_epoch:          # IterableDataset safety
+                if step >= self.steps_per_epoch:
                     break
 
-                # --------------- staged-training: unfreeze HuBERT -----------
+                # --------------------- HuBERT staged training ----------------
                 if (not self.hubert_unfrozen and
                     self.hubert_unfreeze_steps is not None and
                     self.global_step >= self.hubert_unfreeze_steps):
-
                     print(f"\n>>> Step {self.global_step}: unfreezing HuBERT")
                     self.model.unfreeze_hubert()
-
-                    # rebuild optimiser / scheduler with the same LR
                     lr_now = self.scheduler.get_last_lr()[0]
-                    self.optimizer = torch.optim.AdamW(
-                        self.model.parameters(), lr=lr_now
-                    )
-                    total_steps  = self.num_epochs * self.steps_per_epoch
-                    warmup_steps = int(self.cfg_train.get("warmup_ratio", 0.1)
-                                    * total_steps)
+                    self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr_now)
+                    tot_steps  = self.num_epochs * self.steps_per_epoch
+                    warm      = int(self.cfg_train.get("warmup_ratio", 0.1)*tot_steps)
                     self.scheduler = get_cosine_schedule_with_warmup(
-                        self.optimizer, warmup_steps, total_steps,
-                        num_cycles=0.5, last_epoch=self.global_step-1
+                        self.optimizer, warm, tot_steps, num_cycles=0.5,
+                        last_epoch=self.global_step-1
                     )
-
                     self.hubert_unfrozen = True
                     self.print_trainable_params("(After HuBERT Unfreezing)")
-                    self.logger.info(f"Unfroze HuBERT at step {self.global_step}")
-
                     if self.use_wandb:
-                        wandb.log({
-                            "train/hubert_unfrozen": 1,
-                            "train/stage": 2,        # full model
-                        }, step=self.global_step)
+                        wandb.log({"train/hubert_unfrozen":1,"train/stage":2},
+                                step=self.global_step)
 
-                # ---------------- Grad-Cache STEP-1  ------------------------
+                # --------------------- Grad-Cache STEP-1  (enc fwd) ----------
                 F, G, extra = _encode_representations(
-                    self.model, batch, self.device
-                )
-                loss_scalar, grad_F, grad_G, outputs = _loss_on_reprs(
-                    self.model, F, G, extra
+                    self.model, batch, self.device,
+                    encode_micro_bs=encode_bs, store_on_cpu=False
                 )
 
-                # ---------------- Grad-Cache STEP-2  ------------------------
+                # --------------------- similarity & loss (no huge tensor) ----
+                scale = torch.exp(self.model.logit_scale)
+                clip_sims, token_diag = _clip_sims_blockwise(
+                    F, G, extra["a_mask"], scale, blk=blk_pairs
+                )
+
+                B = clip_sims.size(0)
+                labels = torch.eye(B, device=clip_sims.device)*2 - 1
+                logits = clip_sims + self.model.bias
+                loss   = -torch.nn.functional.logsigmoid(labels*logits).mean()
+
+                loss.backward()                       # fills F.grad / G.grad
+                grad_F, grad_G = F.grad.detach(), G.grad.detach()
+
+                # --------------------- Grad-Cache STEP-2  (enc back) ---------
                 self.optimizer.zero_grad(set_to_none=True)
+                _run_audio_backward(self.model, batch, grad_F, micro_bs, self.device)
+                _run_vision_backward(self.model, batch, grad_G, micro_bs, self.device)
 
-                _run_audio_backward(
-                    self.model, batch, grad_F, micro_bs, self.device
-                )
-                _run_vision_backward(
-                    self.model, batch, grad_G, micro_bs, self.device
-                )
-
-                # ---------------- optimiser / scheduler --------------------
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), 1.0
-                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
                 self.scheduler.step()
 
-                # ---------------- bookkeeping & logging --------------------
-                loss_val = float(loss_scalar)
+                # --------------------- bookkeeping ---------------------------
+                loss_val = float(loss.detach())
                 epoch_losses.append(loss_val)
                 pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
-                if self.use_wandb and \
-                self.global_step % self.cfg_wandb.get("log_freq", 10) == 0:
+                if self.use_wandb and self.global_step % self.cfg_wandb.get("log_freq",10)==0:
                     wandb.log({
-                        "train/loss":     loss_val,
-                        "train/step":     self.global_step,
-                        "train/epoch":    epoch,
-                        "train/lr":       self.scheduler.get_last_lr()[0],
-                        "grad_norm":      float(grad_norm),
+                        "train/loss": loss_val,
+                        "train/lr":   self.scheduler.get_last_lr()[0],
+                        "grad_norm":  float(grad_norm),
+                        "train/step": self.global_step,
+                        "train/epoch":epoch,
                     }, step=self.global_step)
 
-                # ---------------- periodic visualisation -------------------
-                if self.global_step % self.viz_every_steps == 0 and self.global_step > 1:
-                    figs = self.visualizer.visualize_batch(
-                        batch, outputs, step=self.global_step
-                    )
+                # ---- visualiser needs only diagonal token sims --------------
+                if self.global_step % self.viz_every_steps == 0:
+                    viz_out = {
+                        "loss": loss.detach(),
+                        "clip_sims": clip_sims.detach(),
+                        "token_sims": token_diag.detach(),   # (B,Na,Nv)
+                        "audio_feats": F.detach(),
+                        "visual_feats": G.detach(),
+                        "audio_attention_mask": extra["a_mask"].detach(),
+                    }
+                    figs = self.visualizer.visualize_batch(batch, viz_out,
+                                                        step=self.global_step)
                     if self.use_wandb and figs:
-                        wandb.log({
-                            f"heatmaps/{name}": wandb.Image(fig)
-                            for name, fig in figs
-                        }, step=self.global_step)
+                        wandb.log({f"heat/{n}": wandb.Image(f) for n,f in figs},
+                                step=self.global_step)
 
-                # ---------------- checkpoints ------------------------------
                 if (self.global_step % self.checkpoint_every_steps == 0
-                        and self.global_step != 0):
+                        and self.global_step):
                     self.save_checkpoint(epoch, self.global_step)
 
                 self.global_step += 1
 
-            # ---------------- end-of-epoch summary -------------------------
+            # --------------------- end-of-epoch ------------------------------
             mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             self.logger.info(f"Epoch {epoch} – mean loss {mean_loss:.4f}")
-
             if self.use_wandb:
-                wandb.log({
-                    "epoch/mean_loss": mean_loss,
-                    "epoch/epoch":     epoch,
-                }, step=self.global_step)
-
+                wandb.log({"epoch/mean_loss": mean_loss, "epoch/epoch": epoch},
+                        step=self.global_step)
             self.save_checkpoint(epoch, self.global_step)
 
         print("Training completed!")
         if self.use_wandb:
             wandb.finish()
+
+
+    # -----------------------------------------------------------------
+    # Checkpoint RESUME helpers
+    # -----------------------------------------------------------------
+
+    def _find_latest_checkpoint(self):
+        """Return Path to most recent checkpoint or None if none exist."""
+        ckpt_files = list(self.output_dir.glob("checkpoint_epoch*_step*.pt"))
+        ckpt_files = [p for p in ckpt_files if not p.name.endswith(".temp.pt")]
+        if not ckpt_files:
+            return None
+
+        # Pick checkpoint with the largest step index (parse after '_step')
+        def _step_num(p: Path):
+            try:
+                return int(p.stem.split("_step")[1])
+            except (IndexError, ValueError):
+                return -1
+
+        latest = max(ckpt_files, key=_step_num)
+        return latest
+
+    def _load_checkpoint(self, ckpt_path: Path):
+        """Load model/optim/scheduler state and update bookkeeping vars."""
+        self.logger.info(f"Resuming from checkpoint {ckpt_path}")
+
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+
+        # Restore state
+        self.model.load_state_dict(ckpt["model_state"], strict=False)
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state"])
+
+        # Book-keeping
+        self.global_step = int(ckpt.get("step", 0))
+        self.start_epoch = int(ckpt.get("epoch", 0))
+        self.start_step_in_epoch = self.global_step % self.steps_per_epoch
+
+        # If we are exactly at an epoch boundary (i.e., all batches of the epoch
+        # are complete), move to the next epoch to avoid repeating work.
+        if self.start_step_in_epoch == 0 and self.global_step != 0:
+            self.start_epoch += 1
+
+        # Work out HuBERT unfrozen status after loading
+        if self.hubert_unfreeze_steps is not None and self.global_step < self.hubert_unfreeze_steps:
+            self.hubert_unfrozen = False
+        else:
+            self.hubert_unfrozen = True
+
+        self.logger.info(
+            f"Checkpoint loaded – epoch {self.start_epoch}, global step {self.global_step}, "
+            f"start_step_in_epoch {self.start_step_in_epoch}"
+        )
+
+        print(f"[Auto-resume] Loaded checkpoint {ckpt_path} | epoch {self.start_epoch} | "
+              f"global step {self.global_step}")
 
 
 if __name__ == "__main__":
@@ -368,8 +433,8 @@ if __name__ == "__main__":
             
             # Data settings
             "micro_batch_size": 32,        # fits comfortably in GPU RAM
-            "batch_size": 44,
-            "num_workers": 8,
+            "batch_size": 256,
+            "num_workers": 4,
             
             # Training schedule
             "num_epochs": 3,
@@ -383,6 +448,7 @@ if __name__ == "__main__":
             # Checkpointing
             "output_dir": "checkpoints",
             "checkpoint_every_steps": 2000,
+            "auto_resume": False,
             
             "viz_every_steps": 5000,
             "viz_batch_limit": 32,

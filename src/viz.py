@@ -230,7 +230,7 @@ class VeSVisualizer:
             # Generate video and collect frames
             frames, timestamps = self._encode_sample(
                 image_t=imgs[i],
-                token_sims=sims[i, i],                      # (Na,Nv)
+                token_sims=sims[i],                      # (Na,Nv)
                 audio_np=audio[i],
                 sr=sr[i],
                 basename=basename,

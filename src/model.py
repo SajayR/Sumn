@@ -237,7 +237,7 @@ def _detach_repr(t: torch.Tensor) -> torch.Tensor:
     """
     return t.detach().requires_grad_(True)
 
-
+'''
 @torch.no_grad()
 def _encode_representations(model, batch, device):
     """
@@ -250,7 +250,7 @@ def _encode_representations(model, batch, device):
     audio  = batch["audio"].to(device)
     images = batch["image"].to(device)
     mask   = batch["audio_attention_mask"].to(device)
-
+    print(f"Audio shape: {audio.shape}")
     model.eval()                               # ❶  no dropout
     with torch.no_grad():
         a_repr, a_mask = model.audio_embedder(audio, mask)
@@ -261,7 +261,65 @@ def _encode_representations(model, batch, device):
         _detach_repr(a_repr),                  # F
         _detach_repr(v_repr),                  # G
         {"a_mask": a_mask},
+    )'''
+
+# ------------------------------------------------------------------
+#  encode the *virtual* batch in micro-batches  (Step-1)
+# ------------------------------------------------------------------
+@torch.no_grad()
+def _encode_representations(
+    model,
+    batch,
+    device,
+    encode_micro_bs: int | None = None,
+    store_on_cpu: bool = False,          # set True if still tight on VRAM
+):
+    """
+    Returns
+    -------
+      F  : (B, N_a, D)  audio-token reps (requires_grad = True)
+      G  : (B, N_v, D)  visual-patch reps (requires_grad = True)
+      extra : {"a_mask": (B, N_a)}
+    """
+    audio  = batch["audio"]
+    images = batch["image"]
+    mask   = batch["audio_attention_mask"]
+
+    B = audio.size(0)
+    encode_micro_bs = encode_micro_bs or B         # full batch if not given
+
+    a_chunks, m_chunks, v_chunks = [], [], []
+
+    model.eval()                                   # disable dropout
+    for s in range(0, B, encode_micro_bs):
+        e = min(s + encode_micro_bs, B)
+
+        a_rep, a_mask = model.audio_embedder(
+            audio[s:e].to(device), mask[s:e].to(device)
+        )
+        v_rep = model.visual_embedder(images[s:e].to(device))
+
+        if store_on_cpu:                           # optional CPU offload
+            a_rep  = a_rep.cpu()
+            v_rep  = v_rep.cpu()
+            a_mask = a_mask.cpu()
+
+        a_chunks.append(a_rep)
+        m_chunks.append(a_mask)
+        v_chunks.append(v_rep)
+
+    model.train()                                  # back to training mode
+
+    a_repr = torch.cat(a_chunks, 0).to(torch.bfloat16).to(device)
+    v_repr = torch.cat(v_chunks, 0).to(torch.bfloat16).to(device)
+    a_mask = torch.cat(m_chunks, 0).to(device)
+
+    return (
+        _detach_repr(a_repr),      # F – requires_grad=True, no history
+        _detach_repr(v_repr),      # G
+        {"a_mask": a_mask},        # extras
     )
+
 
 def _loss_on_reprs(model, F, G, extras):
     """
@@ -315,6 +373,57 @@ def _run_vision_backward(model, batch, grad_G, micro_bs, device, use_amp=True):
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
             feats = model.visual_embedder(images[s:e])
         feats.backward(grad_G[s:e].to(device))
+
+
+
+# ---------------------------------------------------------------------------
+#  BLOCK-WISE similarity helper  –  no huge (B,B,Na,Nv) tensor on GPU
+# ---------------------------------------------------------------------------
+def _clip_sims_blockwise(F, G, a_mask, scale, blk=8):
+    """
+    F : (B, Na, D)  bf16 or fp32
+    G : (B, Nv, D)
+    a_mask : (B, Na)
+    Returns:
+        clip_sims   (B,B)  bf16  (cast back to fp32 only if you need high-precision logging)
+        token_diag  (B,Na,Nv) bf16
+    """
+    B, Na, _ = F.shape
+    Nv = G.shape[1]
+    rows, token_diag = [], []
+
+    # make sure we compute inside an autocast region
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+
+        for i0 in range(0, B, blk):
+            i1 = min(i0 + blk, B)
+            Fi   = F[i0:i1]                     # (bi,Na,D)
+            Mi   = a_mask[i0:i1].float()
+            Vi   = Mi.sum(dim=1, keepdim=True).clamp_min(1e-5)
+            row_chunks = []
+
+            for j0 in range(0, B, blk):
+                j1 = min(j0 + blk, B)
+                Gj = G[j0:j1]                  # (bj,Nv,D)
+
+                sim = torch.einsum(
+                    "b t d, j v d -> b j t v", Fi, Gj
+                ) * scale.to(F.dtype)          # bf16 × bf16
+
+                a2v_clip = (sim.max(3).values * Mi.unsqueeze(1)).sum(2) / Vi
+                v2a_clip = sim.max(2).values.mean(2)
+                row_chunks.append(0.5 * (a2v_clip + v2a_clip))
+
+                if i0 == j0:                   # store diagonal for viz
+                    diag = torch.arange(i1 - i0, device=F.device)
+                    token_diag.append(sim[diag, diag])
+
+            rows.append(torch.cat(row_chunks, dim=1))
+
+    clip_sims  = torch.cat(rows, dim=0)
+    token_diag = torch.cat(token_diag, dim=0)
+    return clip_sims, token_diag
+
 
 
 class VeS(nn.Module):
