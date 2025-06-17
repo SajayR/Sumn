@@ -332,7 +332,7 @@ class VeSTrainer:
                     }, step=self.global_step)
 
                 # ---- visualiser needs only diagonal token sims --------------
-                if self.global_step % self.viz_every_steps == 0:
+                if self.global_step % self.viz_every_steps == 0 and self.global_step > 0:
                     viz_out = {
                         "loss": loss.detach(),
                         "clip_sims": clip_sims.detach(),
@@ -443,14 +443,14 @@ if __name__ == "__main__":
             # Optimization
             "learning_rate": 3e-4,
             "warmup_ratio": 0.1,  
-            "hubert_unfreeze_steps": 0,  
+            "hubert_unfreeze_steps": 1000,  
             
             # Checkpointing
             "output_dir": "checkpoints",
-            "checkpoint_every_steps": 2000,
-            "auto_resume": False,
+            "checkpoint_every_steps": 1000,
+            "auto_resume": True,
             
-            "viz_every_steps": 5000,
+            "viz_every_steps": 500,
             "viz_batch_limit": 32,
         },
         "logging": {
@@ -458,9 +458,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
+            "enabled": True,
             "project": "VeS",
-            "name": "Staged_Training",
+            "name": "Grad-Cache",
             "log_freq": 1, 
             "watch_model": False,  
         },
