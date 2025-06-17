@@ -97,7 +97,7 @@ class VeSTrainer:
         # Initialize model with staged training if configured
         freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
         self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
-        self.model.visual_embedder.fuse_lora()
+        #self.model.visual_embedder.fuse_lora()
         #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
         self.model.train()
         
@@ -238,7 +238,7 @@ class VeSTrainer:
         # ----------------------------------------------------- boiler-plate
         self.print_trainable_params("(Initial State)")
 
-        micro_bs = self.cfg_train.get("micro_batch_size", 8)
+        micro_bs = self.cfg_train.get("micro_batch_size", 32)
 
         for epoch in range(self.num_epochs):
             epoch_losses = []
