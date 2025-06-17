@@ -167,6 +167,9 @@ class VisionEncoder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
 
+    def fuse_lora(self):
+        self.model = self.model.merge_and_unload() 
+
     def patch_dropout_layer(self, x: torch.Tensor, drop_p: float):
         """
         x : (B, N, D) 
@@ -205,7 +208,6 @@ class VisionEncoder(nn.Module):
 class VeS(nn.Module):
     def __init__(
         self, 
-        use_amp=True,
     ):
         super().__init__()
 
@@ -216,57 +218,9 @@ class VeS(nn.Module):
         self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
         self.bias = nn.Parameter(torch.tensor(0.0))
-        self.use_amp = use_amp
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.amp_dtype = torch.bfloat16
 
         self.tv_weight = 0.0001
-        
-    def process_audio(self, audio_input: torch.Tensor):
-        """
- 
-        Args:
-            audio_input: (B, T) raw audio waveform at 16kHz
-            
-        Returns:
-            processed_audio: processed audio tensor
-            attention_mask: (B, L) attention mask for audio tokens
-        """
-        # batched tensor to list of 1D arrays 
-        if len(audio_input.shape) == 2:  # (B, T)
-            audio_list = [audio_input[i].cpu().numpy() for i in range(audio_input.shape[0])]
-        else:  
-            audio_list = audio_input.cpu().numpy()
-        
-        processed = self.audio_processor(
-            audio_list, 
-            return_tensors="pt",
-            sampling_rate=16000,
-            padding=True,
-            return_attention_mask=True
-        )
-        
-        device = next(self.parameters()).device
-        processed_audio = processed.input_values.to(device)
-        attention_mask = processed.attention_mask.to(device)
-        
-        return processed_audio, attention_mask
-    
-
-    
-    def process_image(self, images):
-        """
-        Args:
-            images: PIL Image(s) or image tensors
-            
-        Returns:
-            pixel_values: (B, 3, H, W) processed image tensor
-        """
-        processed = self.visual_processor(images=images, return_tensors="pt")
-        device = next(self.parameters()).device
-        pixel_values = processed.pixel_values.to(device)
-        
-        return pixel_values
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -404,8 +358,7 @@ class VeS(nn.Module):
         """
         B = clip_sims.size(0)
 
-        labels = torch.full_like(clip_sims, -1.0)
-        labels.fill_diagonal_(1.0)           # positives on the main diagonal
+        labels = torch.eye(B, device=clip_sims.device) * 2 - 1  # +1 on diag,  elsewhere
         logits        = clip_sims + self.bias      # broadcast learnable bias b
         pairwise_loss = -F.logsigmoid(labels * logits).mean()
 
@@ -434,34 +387,14 @@ class VeS(nn.Module):
                 - audio_feats: (B, Na, D) audio features
                 - visual_feats: (B, Nv, D) visual features
         """
-        processed_audio, raw_audio_attention_mask = audio_input, attention_mask #self.process_audio(audio_input)
-
-        if isinstance(images, torch.Tensor):
-            device = next(self.parameters()).device
-            pixel_values = images.to(device)
-        else:
-            pixel_values = self.process_image(images)
-
-        if self.use_amp:
-            with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                audio_feats, attention_mask = self.audio_embedder(processed_audio, raw_audio_attention_mask)
-                visual_feats = self.visual_embedder(pixel_values)
-                clip_sims, token_sims = self.compute_all_similarities_tv(
-                    audio_feats, 
-                    visual_feats, 
-                    attention_mask
-                )
-                loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
-        else:
-            audio_feats, attention_mask = self.audio_embedder(processed_audio, raw_audio_attention_mask)
-            visual_feats = self.visual_embedder(pixel_values)
-            clip_sims, token_sims = self.compute_all_similarities_tv(
-                audio_feats, 
-                visual_feats, 
-                attention_mask
-            )
-            loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
-        #print(token_sims.shape)
+        audio_feats, attention_mask = self.audio_embedder(audio_input, attention_mask)
+        visual_feats = self.visual_embedder(images)
+        clip_sims, token_sims = self.compute_all_similarities_tv(
+            audio_feats, 
+            visual_feats, 
+            attention_mask
+        )
+        loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
         return {
             'loss': loss,
             'clip_sims': clip_sims.detach(),

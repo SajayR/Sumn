@@ -20,8 +20,8 @@ from pathlib import Path
 import yaml
 import argparse
 import time
-import bitsandbytes as bnb
-from splus import SPlus
+#import bitsandbytes as bnb
+#from splus import SPlus
 from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
@@ -36,40 +36,6 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
-
-def make_vaani_collate_fn(audio_processor):
-    """
-    Collate function for the VAANI paired dataset.
-
-    • Stacks (already processed) image tensors.
-    • Pads & tokenises raw audio waveforms.
-    • Keeps unclipped raw audio for (future) visualisation/debug.
-    """
-
-    def collate(batch):
-        # --- unzip batch ---------------------------------------------------
-        raw_audio_list = [item["audio"] for item in batch]          # list(np.ndarray)
-        sr_list        = [item["sampling_rate"] for item in batch]
-        image_tensor   = torch.stack([item["image"] for item in batch])
-
-        processed = audio_processor(
-            raw_audio_list,
-            sampling_rate=sr_list[0],   # VAANI audio is 16 kHz throughout
-            padding=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-    
-        return {
-                "input_values"  : processed.input_values,   # (B, L)
-                "attention_mask": processed.attention_mask, # (B, L)
-                "image"         : image_tensor,             # (B, 3, 224, 224)
-
-                # raw components (optional, e.g. viz)
-                "raw_audio"     : raw_audio_list,
-                "sampling_rate" : sr_list,
-            }
-    return collate
 
 
 class VeSTrainer:
@@ -102,9 +68,10 @@ class VeSTrainer:
         # Initialize visualizer
         self.visualizer = VeSVisualizer(
             out_dir=self.output_dir / "viz",
-            fps=25,
-            max_samples_per_call=self.cfg_train.get("viz_batch_limit", 4),
+            token_hz=50,            # 20 ms per token
+            max_samples_per_call=15,
         )
+
         
         # ----------------------------- wandb -------------------------------
         self.use_wandb = self.cfg_wandb.get("enabled", False)
@@ -122,22 +89,17 @@ class VeSTrainer:
             self._init_wandb(config)
 
         # ----------------------------- data --------------------------------
-        self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
-        print("Initializing dataset...get ready bitches")
+        #self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
+        #print("Initializing dataset...get ready bitches")
 
         # Get data configuration
         self.cfg_data = config.get("data", {})
-        dataset = VAAPairedDataset(
-            index_path=self.cfg_data.get("index_path", "/home/cis/CisStuff/VeS/image_index.pkl"),
-            crop_strategy=self.cfg_data.get("crop_strategy", "pad_square"),
-            target_size=self.cfg_data.get("target_size", 224),
-            audio_configs=self.cfg_data.get("audio_configs", None)
-        )
+        dataset = VAAPairedDataset()
 
         self.dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size,
-            collate_fn=make_vaani_collate_fn(self.processor),
+            #collate_fn=make_vaani_collate_fn(self.processor),
             num_workers=self.cfg_train.get("num_workers", 4),
             pin_memory=True,
             persistent_workers=False,
@@ -146,11 +108,13 @@ class VeSTrainer:
         print("pffft aight")
         
         # ----------------------------- model/optim -------------------------
-        self.model = VeS(use_amp=self.cfg_train.get("use_amp", True)).to(self.device)
-
-        #self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
+        self.model = VeS().to(self.device)
+        self.model.visual_embedder.fuse_lora()
+        #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
+        self.model.train()
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
-        self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
+        #self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
         
         # Calculate total steps for cosine schedule with warmup
         total_steps = len(self.dataloader)#self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
@@ -240,8 +204,8 @@ class VeSTrainer:
 
     def train(self):
         for epoch in range(self.num_epochs):
-            self.optimizer.train()
-            self.model.train()
+            #self.optimizer.train()
+
             epoch_losses = []
             steps_per_epoch = len(self.dataloader)
             pbar = tqdm(enumerate(self.dataloader), total=steps_per_epoch, desc=f"Epoch {epoch}")
@@ -258,11 +222,12 @@ class VeSTrainer:
                 if step >= self.steps_per_epoch:
                     break  # bound the epoch length for IterableDataset
 
-                audio  = batch["input_values"].to(self.device)
+                audio  = batch["audio"].to(self.device)
                 images = batch["image"].to(self.device)
-
-                outputs = self.model(audio, images, attention_mask=batch["attention_mask"].to(self.device))
-                loss    = outputs["loss"] / self.gradient_accumulation
+                
+                with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                    outputs = self.model(audio, images, attention_mask=batch["audio_attention_mask"].to(self.device))
+                    loss    = outputs["loss"] / self.gradient_accumulation
 
                 loss.backward()
                 
@@ -275,7 +240,7 @@ class VeSTrainer:
                     # Clip gradients
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-                    self.scheduler.step()
+                    #self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     
                     # Log gradient norm to wandb
@@ -290,9 +255,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 if self.global_step % self.viz_every_steps == 0:
                     self.visualizer.visualize_batch(
-                        batch,                         # still on CPU for everything but image
-                        #{k: (v.detach() if torch.is_tensor(v) else v)
-                          #  for k, v in outputs.items()},
+                        batch,                       
                         outputs,
                         step=self.global_step,
                     )

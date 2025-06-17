@@ -9,3 +9,4 @@ htmlcov/
 /src/splus.py
 /checkpoints
 image_index.pkl
+/dataset

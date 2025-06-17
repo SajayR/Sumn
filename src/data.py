@@ -5,7 +5,8 @@ import os
 import pickle
 from functools import partial
 import numpy as np
-from datasets import load_dataset, interleave_datasets, Image
+import json
+import librosa
 from tqdm import tqdm
 import torch
 from torch.utils.data import IterableDataset
@@ -13,38 +14,17 @@ from PIL import Image as PILImage
 import random
 import torchvision.transforms as transforms
 
-def build_and_save_image_index(cache_dir, index_path="image_index.pkl"):
-    image_dataset = load_dataset(
-        "ARTPARK-IISc/VAANI",
-        "images", 
-        split="train",
-        cache_dir=cache_dir,
-    ).cast_column("image", Image(decode=False))
-    
-    print(f"Building index for {len(image_dataset)} images...")
-    image_index = {}
-    
-    for idx, row in enumerate(tqdm(image_dataset, desc="Building index")):
-        filename = os.path.basename(row["image"]["path"])
-        image_index[filename] = idx
-    
-    with open(index_path, 'wb') as f:
-        pickle.dump(image_index, f)
-    
-    print(f"Saved {index_path}")
-    return image_index
-
-def process_image(image_bytes, crop_strategy="pad_square", target_size=224):
+def process_image(image_path, crop_strategy="pad_square", target_size=224):
     """
     Args:
-        image_bytes: Raw image bytes
+        image_path: Path to image file
         crop_strategy: One of ["stretch", "center_crop", "random_crop", "pad_square"]
         target_size: Target size (224 for ViT)
     
     Returns:
         torch.Tensor: Normalized image tensor [3, 224, 224]
     """
-    image = PILImage.open(BytesIO(image_bytes)).convert('RGB')
+    image = PILImage.open(image_path).convert('RGB')
     
     if crop_strategy == "stretch":
         # stretch to target size
@@ -101,127 +81,109 @@ def process_image(image_bytes, crop_strategy="pad_square", target_size=224):
 
 class VAAPairedDataset(IterableDataset):
     
-    def __init__(self, index_path="/home/cis/CisStuff/VeS/image_index.pkl",
-                 crop_strategy="pad_square", target_size=224, audio_configs=None,):
+    def __init__(self, 
+                 completed_audio_path="/bigchungus/CisStuff/VeS/dataset/completed_audio_files.txt",
+                 json_mapping_path="/bigchungus/CisStuff/VeS/dataset/vaani_hindi_only.json",
+                 data_base_path="/bigchungus/data",
+                 crop_strategy="pad_square", 
+                 target_size=224,
+                 max_audio_duration=5.0,
+                 sampling_rate=16000):
         super().__init__()
-        if audio_configs is None:
-            audio_configs = ["Delhi_NewDelhi", 'WestBengal_Alipurduar', 'WestBengal_CoochBehar', 'WestBengal_DakshinDinajpur', 'WestBengal_Darjeeling', 'WestBengal_Jalpaiguri']#, 'WestBengal_Jhargram', 'WestBengal_Kolkata', 'WestBengal_Malda', 'WestBengal_North24Parganas', 'WestBengal_PaschimMedinipur', 'WestBengal_Purulia', 'Bihar_Araria', 'Bihar_Begusarai',]
-
+        
+        self.data_base_path = data_base_path
         self.crop_strategy = crop_strategy
         self.target_size = target_size
+        self.max_audio_duration = max_audio_duration
+        self.sampling_rate = sampling_rate
         
-        print("Loading image index...")
-        with open(index_path, 'rb') as f:
-            self.image_index = pickle.load(f)
-
-        print("Loading image dataset (memory-mapped)...")
-        self.image_dataset = load_dataset(
-            "ARTPARK-IISc/VAANI",
-            "images",
-            split="train", 
-            #cache_dir=cache_dir,
-            #num_proc=0,  
-            #keep_in_memory=False
-        ).cast_column("image", Image(decode=False))
-    
-        print(f"Loading {len(audio_configs)} audio configs in streaming mode...")
-        audio_streams = []
-        for config in audio_configs:
-            try:
-                ds = load_dataset(
-                    "ARTPARK-IISc/VAANI",
-                    config,
-                    split="train",
-                    #streaming=True,
-                    download_mode="reuse_dataset_if_exists",
-                    #cache_dir=cache_dir,
-                    #streaming=True,
-                    #num_proc=12
-                )
-                ds = ds.remove_columns("transcript") 
-                audio_streams.append(ds)
-                print(f"✓ Loaded {config}")
-            except Exception as e:
-                print(f"✗ Failed to load {config}: {e}")
-        self.interleaved_audio = interleave_datasets(
-            audio_streams,
-            probabilities=None,  
-            seed=69
-        )
-        #self.interleaved_audio = self.interleaved_audio.with_format("torch")
+        print("Loading completed audio files list...")
+        with open(completed_audio_path, 'r') as f:
+            self.completed_audio_files = [line.strip() for line in f.readlines()]
+        print(f"Loaded {len(self.completed_audio_files)} completed audio files")
+        
+        print("Loading JSON mapping...")
+        with open(json_mapping_path, 'r') as f:
+            mapping_data = json.load(f)
+        
+        # Create a mapping from audioFileName to imageFileName
+        self.audio_to_image_map = {}
+        for item in mapping_data:
+            self.audio_to_image_map[item['audioFileName']] = item['imageFileName']
+        print(f"Loaded {len(self.audio_to_image_map)} audio-image mappings")
+        
+        # Filter completed audio files to only include those with image mappings
+        self.valid_audio_files = []
+        for audio_file in self.completed_audio_files:
+            if audio_file in self.audio_to_image_map:
+                self.valid_audio_files.append(audio_file)
+        
+        print(f"Found {len(self.valid_audio_files)} valid audio files with image mappings")
+        
+        # Shuffle the list for better training
+        random.shuffle(self.valid_audio_files)
 
     def __len__(self):
-        return len(self.interleaved_audio)
+        return len(self.valid_audio_files)
     
     def __iter__(self):
-        for audio_item in self.interleaved_audio:
-            img_filename = os.path.basename(audio_item["referenceImage"])
-            if img_filename not in self.image_index:
-                print(f"Warning: Image {img_filename} not found in index, skipping...")
+        for audio_file in self.valid_audio_files:
+            try:
+                # Get corresponding image file
+                image_file = self.audio_to_image_map[audio_file]
+                
+                # Construct full paths
+                audio_path = os.path.join(self.data_base_path, audio_file)
+                image_path = os.path.join(self.data_base_path, image_file)
+                
+                # Check if files exist
+                if not os.path.exists(audio_path):
+                    print(f"Warning: Audio file not found: {audio_path}")
+                    continue
+                if not os.path.exists(image_path):
+                    print(f"Warning: Image file not found: {image_path}")
+                    continue
+                
+                # Load and process audio
+                audio_array, sr = librosa.load(audio_path, sr=self.sampling_rate)
+                
+                # Truncate or pad audio to max duration
+                max_samples = int(self.max_audio_duration * self.sampling_rate)
+                original_length = len(audio_array)
+                
+                if len(audio_array) > max_samples:
+                    # Random crop if longer than max duration
+                    start_idx = random.randint(0, len(audio_array) - max_samples)
+                    audio_array = audio_array[start_idx:start_idx + max_samples]
+                    # All samples are valid after cropping
+                    attention_mask = np.ones(max_samples, dtype=np.float32)
+                else:
+                    # Pad with zeros if shorter than max duration
+                    padding = max_samples - len(audio_array)
+                    audio_array = np.pad(audio_array, (0, padding), mode='constant')
+                    # Create attention mask: 1 for real audio, 0 for padding
+                    attention_mask = np.concatenate([
+                        np.ones(original_length, dtype=np.float32),
+                        np.zeros(padding, dtype=np.float32)
+                    ])
+                
+                # Process image
+                image_tensor = process_image(image_path, self.crop_strategy, self.target_size)
+                
+                # Convert audio and mask to tensors
+                audio_tensor = torch.from_numpy(audio_array).float()
+                attention_mask_tensor = torch.from_numpy(attention_mask).float()
+                
+                yield {
+                    "audio": audio_tensor,  # torch.Tensor [T]
+                    "audio_attention_mask": attention_mask_tensor,  # torch.Tensor [T]
+                    "sampling_rate": self.sampling_rate,  # int
+                    "image": image_tensor,  # torch.Tensor [3, 224, 224]
+                    "audio_path": audio_path,
+                    "image_path": image_path,
+                }
+                
+            except Exception as e:
+                print(f"Error processing {audio_file}: {e}")
                 continue
-            img_idx = self.image_index[img_filename]
-            image_item = self.image_dataset[img_idx]
-  
-            audio_array = audio_item["audio"]["array"]
-            sampling_rate = audio_item["audio"]["sampling_rate"]
-            max_samples = 5 * sampling_rate  # 5 secs
-            
-            if len(audio_array) > max_samples:
-                start_idx = np.random.randint(0, len(audio_array) - max_samples + 1)
-                audio_array = audio_array[start_idx:start_idx + max_samples]
 
-            image_tensor = process_image(
-                image_item["image"]['bytes'], 
-                self.crop_strategy, 
-                self.target_size
-            )
-            #print(type(audio_array))
-            #print(audio_array.shape)
-            ##print(type(image_tensor))
-            #print(image_tensor.shape)
-            yield {
-                "audio": audio_array,  # torch.Tensor [1, T]
-                "sampling_rate": sampling_rate,  # int
-                "image": image_tensor,  # torch.Tensor [3, 224, 224]
-            }
-
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="/home/cis/VaaniCache")
-    parser.add_argument("--build_index", action="store_true", 
-                       help="Build image index (run once)")
-    parser.add_argument("--test_loading", action="store_true",
-                       help="Test the dataset by loading a few examples")
-    args = parser.parse_args()
-    
-    index_path = "/home/cis/VaaniCache/image_index.pkl"
-    
-    if args.build_index:
-        build_and_save_image_index(args.cache_dir, index_path)
-        return
-
-    AUDIO_CONFIGS = ["Delhi_NewDelhi"]
-    #AUDIO_CONFIGS.extend(['WestBengal_Alipurduar', 'WestBengal_CoochBehar', 'WestBengal_DakshinDinajpur', 'WestBengal_Darjeeling', 'WestBengal_Jalpaiguri', 'WestBengal_Jhargram', 'WestBengal_Kolkata', 'WestBengal_Malda', 'WestBengal_North24Parganas', 'WestBengal_PaschimMedinipur', 'WestBengal_Purulia'])
-    #AUDIO_CONFIGS.extend(['Bihar_Araria', 'Bihar_Begusarai', 'Bihar_Bhagalpur', 'Bihar_Darbhanga', 'Bihar_EastChamparan', 'Bihar_Gaya', 'Bihar_Gopalganj', 'Bihar_Jahanabad', 'Bihar_Jamui', 'Bihar_Kaimur', 'Bihar_Katihar', 'Bihar_Kishanganj', 'Bihar_Lakhisarai', 'Bihar_Madhepura', 'Bihar_Muzaffarpur', 'Bihar_Patna', 'Bihar_Purnia', 'Bihar_Saharsa', 'Bihar_Samastipur', 'Bihar_Saran', 'Bihar_Sitamarhi', 'Bihar_Supaul', 'Bihar_Vaishali', 'Bihar_WestChamparan'])
-    #AUDIO_CONFIGS.extend(['Jharkhand_Deoghar', 'Jharkhand_Garhwa', 'Jharkhand_Jamtara', 'Jharkhand_Palamu', 'Jharkhand_Ranchi', 'Jharkhand_Sahebganj'])
-    #AUDIO_CONFIGS.extend(['UttarPradesh_Budaun', 'UttarPradesh_Deoria', 'UttarPradesh_Etah', 'UttarPradesh_Ghazipur', 'UttarPradesh_Gorakhpur', 'UttarPradesh_Hamirpur', 'UttarPradesh_Jalaun', 'UttarPradesh_JyotibaPhuleNagar', 'UttarPradesh_Lalitpur', 'UttarPradesh_Lucknow', 'UttarPradesh_Muzzaffarnagar', 'UttarPradesh_Saharanpur', 'UttarPradesh_Varanasi', 'Uttarakhand_TehriGarhwal', 'Uttarakhand_Uttarkashi'])
-
-    dataset = VAAPairedDataset(AUDIO_CONFIGS, args.cache_dir, index_path)
-    
-    if args.test_loading:
-
-        print("\nTesting dataset loading...")
-        for i, item in enumerate(dataset):
-            print(f"\nExample {i}:")
-            print(f"  Audio shape: {item['audio'].shape}")
-            print(f"  Sampling rate: {item['sampling_rate']}")
-            print(f"  Image: {item['image'].shape}")
-            
-            if i >= 2: 
-                break
-    
-
-if __name__ == "__main__":
-    main()
