@@ -242,7 +242,7 @@ class VeS(nn.Module):
         self.audio_embedder = AudioEmbedder(freeze_hubert_initially=freeze_hubert_initially)
         self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
-        self.bias = nn.Parameter(torch.tensor(0.0))
+        self.bias = nn.Parameter(torch.tensor(-10.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.tv_weight = 0.0001

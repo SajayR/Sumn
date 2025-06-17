@@ -1,5 +1,5 @@
 # new_visualizer.py
-# Completely rewritten “token-sync” visualiser for the new padded-audio
+# Completely rewritten "token-sync" visualiser for the new padded-audio
 # pipeline (one video-frame every 20 ms = 50 FPS, audio copied verbatim).
 
 import math
@@ -10,6 +10,8 @@ import av                                   # pip install av --no-binary av
 import cv2                                   # pip install opencv-python-headless
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 
 class VeSVisualizer:
@@ -54,7 +56,7 @@ class VeSVisualizer:
         grid: int = 16,
         size: int = 224,
     ) -> np.ndarray:
-        """One token’s patch-similarity vector → coloured uint8 RGB heat-map."""
+        """One token's patch-similarity vector → coloured uint8 RGB heat-map."""
         #print(sim_row.shape)
         assert sim_row.shape == torch.Size([256]), f"Expected sim_row shape [256], got {sim_row.shape}"
         arr = sim_row.view(grid, grid).float().cpu()
@@ -86,7 +88,7 @@ class VeSVisualizer:
         rgb_base = cv2.resize(rgb_base, (448, 448), interpolation=cv2.INTER_CUBIC)
         H, W, _ = rgb_base.shape
 
-        # --- figure out “valid” token count ------------------------------
+        # --- figure out "valid" token count ------------------------------
         mask_tok  = int(attn_mask.round().sum().item())      # robust, still an int
         sim_tok   = token_sims.size(0)                       # what we actually have
         valid_tok = min(mask_tok, sim_tok)                   # stay in bounds
@@ -96,6 +98,11 @@ class VeSVisualizer:
         # audio: 320 samples per token @16 kHz
         expected_samples = valid_tok * 320
         audio_np = audio_np[:expected_samples]
+
+        # --- collect frames for matplotlib visualization -------------------
+        frame_indices = np.linspace(0, valid_tok - 1, min(6, valid_tok), dtype=int)
+        collected_frames = []
+        collected_timestamps = []
 
         # --- open container & streams ------------------------------------
         path = self.out_dir / f"{basename}.mp4"
@@ -127,6 +134,11 @@ class VeSVisualizer:
                 cv2.LINE_AA,
             )
 
+            # Collect frames for matplotlib
+            if t in frame_indices:
+                collected_frames.append(frame_np.copy())
+                collected_timestamps.append(ts_sec)
+
             frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
             for pkt in vstream.encode(frame):
                 container.mux(pkt)
@@ -152,6 +164,40 @@ class VeSVisualizer:
 
         container.close()
 
+        return collected_frames, collected_timestamps
+
+    def _create_frame_plot(
+        self,
+        frames: list[np.ndarray],
+        timestamps: list[float],
+        basename: str,
+    ) -> plt.Figure:
+        """Create a matplotlib figure showing 6 frames from the video."""
+        n_frames = len(frames)
+        if n_frames == 0:
+            return None
+            
+        # Create figure with appropriate size
+        fig = plt.figure(figsize=(15, 10))
+        
+        # Use gridspec for better layout control
+        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.1)
+        
+        for i, (frame, ts) in enumerate(zip(frames, timestamps)):
+            ax = fig.add_subplot(gs[i // 3, i % 3])
+            ax.imshow(frame)
+            ax.set_title(f"t = {ts:.2f}s", fontsize=12)
+            ax.axis('off')
+        
+        fig.suptitle(f"Heatmap Visualization: {basename}", fontsize=16, y=0.98)
+        plt.tight_layout()
+        
+        # Save the figure
+        plot_path = self.out_dir / f"{basename}_frames.png"
+        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        
+        return fig
+
     # ---------------------------------------------------------------------
     #              public API — called from the training loop
     # ---------------------------------------------------------------------
@@ -175,12 +221,26 @@ class VeSVisualizer:
         if isinstance(sr, int):
             sr = [sr] * imgs.size(0)
 
+        # Collect matplotlib figures for wandb logging
+        matplotlib_figures = []
+
         for i in range(min(imgs.size(0), self.max_samples_per_call)):
-            self._encode_sample(
+            basename = f"step{step}_idx{i}"
+            
+            # Generate video and collect frames
+            frames, timestamps = self._encode_sample(
                 image_t=imgs[i],
                 token_sims=sims[i, i],                      # (Na,Nv)
                 audio_np=audio[i],
                 sr=sr[i],
-                basename=f"step{step}_idx{i}",
+                basename=basename,
                 attn_mask=attn[i],
             )
+            
+            # Create matplotlib figure
+            if frames:
+                fig = self._create_frame_plot(frames, timestamps, basename)
+                if fig is not None:
+                    matplotlib_figures.append((basename, fig))
+        
+        return matplotlib_figures

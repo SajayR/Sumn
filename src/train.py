@@ -73,13 +73,6 @@ class VeSTrainer:
         )
         self.logger = logging.getLogger(__name__)
 
-        if self.use_wandb:
-            self._init_wandb(config)
-            # Log initial training stage
-            wandb.log({
-                "train/stage": 1 if freeze_hubert else 0,  # Stage 1: LoRA + projections only, Stage 0: all trainable
-                "train/hubert_unfrozen": 0 if freeze_hubert else 1,
-            }, step=0)
 
         # ----------------------------- data --------------------------------
         #self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
@@ -111,6 +104,7 @@ class VeSTrainer:
         
         # Track if we've unfrozen HuBERT
         self.hubert_unfrozen = not freeze_hubert
+
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
@@ -133,7 +127,13 @@ class VeSTrainer:
         # ----------------------------- misc --------------------------------
         self.global_step = 0
         self.best_loss   = float("inf")
-        
+        if self.use_wandb:
+            self._init_wandb(config)
+            # Log initial training stage
+            wandb.log({
+                "train/stage": 1 if freeze_hubert else 0,  # Stage 1: LoRA + projections only, Stage 0: all trainable
+                "train/hubert_unfrozen": 0 if freeze_hubert else 1,
+            }, step=0)
         # wandb model watching (after model and optimizer are created)
         if self.use_wandb and self.cfg_wandb.get("watch_model", False):
             wandb.watch(self.model, log="all", log_freq=self.cfg_wandb.get("log_freq", 10))
@@ -308,7 +308,7 @@ class VeSTrainer:
                     # Clip gradients
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.optimizer.step()
-                    #self.scheduler.step()
+                    self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     
                     # Log gradient norm to wandb
@@ -322,11 +322,20 @@ class VeSTrainer:
                 #   periodic visualisation
                 # ---------------------------------------------------------
                 if self.global_step % self.viz_every_steps == 0:
-                    self.visualizer.visualize_batch(
+                    matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
                         step=self.global_step,
                     )
+                    
+                    # Log matplotlib figures to wandb
+                    if self.use_wandb and matplotlib_figures:
+                        wandb_images = {}
+                        for basename, fig in matplotlib_figures:
+                            wandb_images[f"heatmaps/{basename}"] = wandb.Image(fig)
+                            plt.close(fig)  # Free memory
+                        
+                        wandb.log(wandb_images, step=self.global_step)
 
                 loss_val = loss.item() * self.gradient_accumulation
                 epoch_losses.append(loss_val)
@@ -386,7 +395,7 @@ if __name__ == "__main__":
             "learning_rate": 3e-4,
             "gradient_accumulation_steps": 4,
             "warmup_ratio": 0.1,  
-            "hubert_unfreeze_steps": 0,  
+            "hubert_unfreeze_steps": 5000,  
             
             # Checkpointing
             "output_dir": "checkpoints",
@@ -400,11 +409,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
+            "enabled": True,
             "project": "VeS",
-            "name": "Staged_Training", 
-            "tags": ["audio-visual", "multimodal"],
-            "notes": "VeS model training with VAANI dataset",
+            "name": "Staged_Training",
             "log_freq": 1, 
             "watch_model": False,  
         },

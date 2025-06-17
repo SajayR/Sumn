@@ -10,7 +10,7 @@ htmlcov/
 /checkpoints
 image_index.pkl
 /dataset
-download.ipynb
+*.ipynb
 requirements.txt
 src/utils/
 viz.ipynb
