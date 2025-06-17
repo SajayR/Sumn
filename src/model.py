@@ -178,8 +178,8 @@ class VisionEncoder(nn.Module):
         self.projection1 = nn.Linear(self.model.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
-        self.patch_dropout_rate = patch_dropout_prob
-        self.patch_dropout = self.patch_dropout_layer
+        #self.patch_dropout_rate = patch_dropout_prob
+        #self.patch_dropout = self.patch_dropout_layer
 
         for name, param in self.model.named_parameters():
             if 'lora_' not in name: 
@@ -221,12 +221,100 @@ class VisionEncoder(nn.Module):
         outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
         patches = outputs.last_hidden_state[:,5:, :] #5 cause 1 is the cls token, 4 are registers
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        if self.training:
-            feats = self.patch_dropout(feats, self.patch_dropout_rate)
+        #if self.training:
+          #  feats = self.patch_dropout(feats, self.patch_dropout_rate)
         feats = F.normalize(feats, dim=-1)
         #print("Dino output shape: ", feats.shape)
         return feats
 
+
+# ------------------------------------------------------------
+#  helpers (put near the top of train.py)
+# ------------------------------------------------------------
+def _detach_repr(t: torch.Tensor) -> torch.Tensor:
+    """
+    Returns a view of `t` that **requires_grad**, but has no history.
+    """
+    return t.detach().requires_grad_(True)
+
+
+@torch.no_grad()
+def _encode_representations(model, batch, device):
+    """
+    Graph-less forward.  Returns (F, G, extra) where
+
+        F  – audio token reprs  (B, N_a, D)
+        G  – visual patch reprs (B, N_v, D)
+        extra – dict with 'mask' etc. for later reuse
+    """
+    audio  = batch["audio"].to(device)
+    images = batch["image"].to(device)
+    mask   = batch["audio_attention_mask"].to(device)
+
+    model.eval()                               # ❶  no dropout
+    with torch.no_grad():
+        a_repr, a_mask = model.audio_embedder(audio, mask)
+        v_repr         = model.visual_embedder(images)
+
+    model.train()                              # ❷  back to training mode
+    return (
+        _detach_repr(a_repr),                  # F
+        _detach_repr(v_repr),                  # G
+        {"a_mask": a_mask},
+    )
+
+def _loss_on_reprs(model, F, G, extras):
+    """
+    Same calculation as model.forward() **but using pre-computed
+    representations**.  Autograd fills F.grad / G.grad.
+
+    Returns
+    -------
+      loss_scalar  – detached scalar
+      grad_F,grad_G
+      outputs_dict – fields expected by visualiser & logging
+    """
+    clip_sims, token_sims = model.compute_all_similarities_tv(
+        F, G, extras["a_mask"]
+    )
+    loss = model.compute_contrastive_loss_tv(
+        clip_sims, token_sims, extras["a_mask"]
+    )
+    loss.backward()                    # autograd now fills F.grad / G.grad
+    outputs = {
+        "loss": loss.detach(),
+        "clip_sims": clip_sims.detach(),
+        "token_sims": token_sims.detach(),
+        "audio_feats": F.detach(),
+        "visual_feats": G.detach(),
+        "audio_attention_mask": extras["a_mask"].detach(),
+    }
+    return loss.detach(), F.grad.detach(), G.grad.detach(), outputs
+
+# ------------------------------------------------------------------
+#  encoder backward with cached grads
+# ------------------------------------------------------------------
+def _run_audio_backward(model, batch, grad_F, micro_bs, device, use_amp=True):
+    """Feeds cached grad_F through audio encoder in micro-batches."""
+    audio = batch["audio"].to(device)
+    mask  = batch["audio_attention_mask"].to(device)
+
+    for s in range(0, audio.size(0), micro_bs):
+        e = min(s + micro_bs, audio.size(0))
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            feats, _ = model.audio_embedder(audio[s:e], mask[s:e])
+        feats.backward(grad_F[s:e].to(device))
+
+
+def _run_vision_backward(model, batch, grad_G, micro_bs, device, use_amp=True):
+    """Feeds cached grad_G through visual encoder in micro-batches."""
+    images = batch["image"].to(device)
+
+    for s in range(0, images.size(0), micro_bs):
+        e = min(s + micro_bs, images.size(0))
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+            feats = model.visual_embedder(images[s:e])
+        feats.backward(grad_G[s:e].to(device))
 
 
 class VeS(nn.Module):
@@ -441,6 +529,7 @@ def dummy_inputs():
     images = torch.randn(batch_size, 3, 224, 224)
     
     return audio_input, images
+'''
 if __name__ == "__main__":
     print("Testing VeS with random inputs...")
     
@@ -475,3 +564,56 @@ if __name__ == "__main__":
         print(f"Visual features shape: {outputs['visual_feats'].shape}")
         print(f"Audio features shape: {outputs['audio_feats'].shape}")
         print(f"Clip similarities shape: {outputs['clip_sims'].shape}")
+'''
+import sys
+
+if __name__ == "__main__" and "--test_cache" in sys.argv:
+    from model import VeS
+    from data import VAAPairedDataset
+    import itertools, sys
+
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = VeS().to(dev).train()
+
+    ds  = VAAPairedDataset()
+    batch = next(iter(torch.utils.data.DataLoader(ds, batch_size=2)))
+
+    # ---- STEP-1 test ----------------------------------------------------
+    F, G, ext = _encode_representations(model, batch, dev)
+    loss, gF, gG = _loss_on_reprs(model, F, G, ext)
+
+    print(f"cache-only forward OK  – loss {loss.item():.4f}")
+    print(f"dL/dF   shape {gF.shape},  mean |grad| {gF.abs().mean():.3e}")
+    print(f"dL/dG   shape {gG.shape},  mean |grad| {gG.abs().mean():.3e}")
+    sys.exit(0)
+
+
+if __name__ == "__main__" and "--test_cache2" in sys.argv:
+    import sys
+    from model import VeS
+    from data import VAAPairedDataset
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    cfg_micro = 8
+    model = VeS().to(dev).train()
+    optim = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    ds = VAAPairedDataset()
+    batch = next(iter(torch.utils.data.DataLoader(ds, batch_size=12)))
+
+    # ---- cache part (Step 1) --------------------------------------------
+    F, G, extra = _encode_representations(model, batch, dev)
+    loss, gF, gG = _loss_on_reprs(model, F, G, extra)
+    print(f"loss on reprs: {loss.item():.4f}")
+
+    # ---- encoder backward (Step 2) --------------------------------------
+    optim.zero_grad(set_to_none=True)
+
+    _run_audio_backward(model, batch, gF, cfg_micro, dev)
+    _run_vision_backward(model, batch, gG, cfg_micro, dev)
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optim.step()
+
+    print(f"after step, total grad-norm {grad_norm:.3f}")
+    sys.exit(0)
