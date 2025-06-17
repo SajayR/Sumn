@@ -167,8 +167,8 @@ class VisionEncoder(nn.Module):
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules, 
-            bias="none",          
-            modules_to_save=None,  
+            #bias="none",          
+            #modules_to_save=None,  
         )
 
         self.model = get_peft_model(self.model, lora_config)
@@ -391,9 +391,9 @@ class VeS(nn.Module):
         #pairwise_loss = pairwise_loss * 10
 
         # optional regularisation (unchanged from the original implementation)
-        reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
+        #reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
 
-        total_loss = pairwise_loss + reg_loss
+        total_loss = pairwise_loss# + reg_loss
 
         return total_loss
     

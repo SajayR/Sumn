@@ -17,25 +17,12 @@ import psutil
 import gc
 import warnings
 from pathlib import Path
-import yaml
-import argparse
 import time
 #import bitsandbytes as bnb
 #from splus import SPlus
 from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train audio-visual model')
-    parser.add_argument('--config', type=str, required=True, help='Path to config file')
-    return parser.parse_args()
-    
-def load_config(config_path):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
 
 
 class VeSTrainer:
@@ -53,7 +40,7 @@ class VeSTrainer:
         )
         self.batch_size                 = self.cfg_train.get("batch_size", 64)
         self.num_epochs                 = self.cfg_train.get("num_epochs", 1)
-        self.steps_per_epoch            = self.cfg_train.get("steps_per_epoch", 1000)
+        #self.steps_per_epoch            = self.cfg_train.get("steps_per_epoch", 1000)
         self.gradient_accumulation      = self.cfg_train.get("gradient_accumulation_steps", 1)
         self.checkpoint_every_steps     = self.cfg_train.get("checkpoint_every_steps", 2000)
         self.learning_rate              = self.cfg_train.get("learning_rate", 1e-4)
@@ -63,14 +50,14 @@ class VeSTrainer:
 
         self.output_dir = Path(self.cfg_train.get("output_dir", "checkpoints"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.vis_out_dir = self.output_dir / "visualizations"
-        self.vis_out_dir.mkdir(parents=True, exist_ok=True)
+        #self.vis_out_dir = self.output_dir / "visualizations"
+        #self.vis_out_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize visualizer
         self.visualizer = VeSVisualizer(
             out_dir=self.output_dir / "viz",
             token_hz=50,            # 20 ms per token
-            max_samples_per_call=15,
+            max_samples_per_call=20,
         )
 
         
@@ -112,7 +99,7 @@ class VeSTrainer:
             drop_last=True,
             prefetch_factor=6,
         )
-        print("pffft aight")
+        self.steps_per_epoch = len(self.dataloader)
         
         # ----------------------------- model/optim -------------------------
         # Initialize model with staged training if configured
@@ -159,7 +146,7 @@ class VeSTrainer:
         config_to_log = {
             "batch_size": self.batch_size,
             "num_epochs": self.num_epochs,
-            "steps_per_epoch": self.steps_per_epoch,
+            #"steps_per_epoch": self.steps_per_epoch,
             "learning_rate": self.learning_rate,
             "gradient_accumulation_steps": self.gradient_accumulation,
             "device": str(self.device),
@@ -254,8 +241,8 @@ class VeSTrainer:
             #self.optimizer.train()
 
             epoch_losses = []
-            steps_per_epoch = len(self.dataloader)
-            pbar = tqdm(enumerate(self.dataloader), total=steps_per_epoch, desc=f"Epoch {epoch}")
+            
+            pbar = tqdm(enumerate(self.dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
 
             accumulation_counter = 0
             print("\n=== LoRA Parameter Verification ===")
@@ -380,9 +367,50 @@ class VeSTrainer:
             wandb.finish()
 
 if __name__ == "__main__":
-    args = parse_args()
-    config = load_config(args.config)
-    print("config loaded")
+    # Hardcoded configuration (previously from config.yaml)
+    config = {
+        "training": {
+            # Device and basic settings
+            "device": "cuda",
+            "use_amp": True,
+            
+            # Data settings
+            "batch_size": 44,
+            "num_workers": 8,
+            
+            # Training schedule
+            "num_epochs": 3,
+          
+            
+            # Optimization
+            "learning_rate": 3e-4,
+            "gradient_accumulation_steps": 4,
+            "warmup_ratio": 0.1,  
+            "hubert_unfreeze_steps": 0,  
+            
+            # Checkpointing
+            "output_dir": "checkpoints",
+            "checkpoint_every_steps": 2000,
+            
+            "viz_every_steps": 5000,
+            "viz_batch_limit": 32,
+        },
+        "logging": {
+            "level": "INFO",
+            "log_file": "training.log",
+        },
+        "wandb": {
+            "enabled": False,
+            "project": "VeS",
+            "name": "Staged_Training", 
+            "tags": ["audio-visual", "multimodal"],
+            "notes": "VeS model training with VAANI dataset",
+            "log_freq": 1, 
+            "watch_model": False,  
+        },
+    }
+    
+    print("Using hardcoded configuration")
     trainer = VeSTrainer(config)
     print("trainer initialized")
     trainer.train()
