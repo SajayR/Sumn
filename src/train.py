@@ -18,8 +18,9 @@ import gc
 import warnings
 from pathlib import Path
 import time
-#import bitsandbytes as bnb
+import bitsandbytes as bnb
 #from splus import SPlus
+
 from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
@@ -53,10 +54,12 @@ class VeSTrainer:
         #self.vis_out_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize visualizer
+        REDUCTION = 2
         self.visualizer = VeSVisualizer(
             out_dir=self.output_dir / "viz",
-            token_hz=50,            # 20 ms per token
+            token_hz=25,            # 20 ms per token
             max_samples_per_call=20,
+            reduction=REDUCTION,
         )
 
         
@@ -276,6 +279,7 @@ class VeSTrainer:
                     self.model.unfreeze_hubert()
                     lr_now = self.scheduler.get_last_lr()[0]
                     self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr_now)
+                    #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=lr_now)
                     tot_steps  = self.num_epochs * self.steps_per_epoch
                     warm      = int(self.cfg_train.get("warmup_ratio", 0.1)*tot_steps)
                     self.scheduler = get_cosine_schedule_with_warmup(
@@ -447,7 +451,7 @@ if __name__ == "__main__":
             
             # Checkpointing
             "output_dir": "checkpoints",
-            "checkpoint_every_steps": 1000,
+            "checkpoint_every_steps": 500,
             "auto_resume": True,
             
             "viz_every_steps": 500,
@@ -458,7 +462,7 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
+            "enabled": False,
             "project": "VeS",
             "name": "Grad-Cache",
             "log_freq": 1, 

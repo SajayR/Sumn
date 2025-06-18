@@ -97,40 +97,47 @@ class AudioEmbedder(nn.Module):
         
         return downsampled_mask
         
-    def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            audio_input: (B, L) processed audio features
-            attention_mask: (B, L) attention mask for audio tokens (input length)
-            
-        Returns:
-            audio_feats: (B, Na, D) where Na is the OUTPUT sequence length
-            output_attention_mask: (B, Na) attention mask for output tokens
-        """
-        hubert_outputs = self.hubert(
-            audio_input, 
+    def forward(
+        self,
+        audio_input: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        # ---------- HuBERT encoder ------------------------------------------
+        hubert_out = self.hubert(
+            audio_input,
             attention_mask=attention_mask,
-            return_dict=True
-        )
-        
-        hubert_output = hubert_outputs.last_hidden_state  # (B, Na, H)
-        output_length = hubert_output.size(1)
-        
-        # Downsample the attention mask to match output length
+            return_dict=True,
+        ).last_hidden_state                    # (B, Na, H)
+
+        # ---------- temporal pooling (REDUCTION = 2) ------------------------
+        REDUCTION = 2
+        hubert_out = hubert_out.transpose(1, 2)                # (B, H, Na)
+        hubert_out = F.avg_pool1d(
+            hubert_out, kernel_size=REDUCTION, stride=REDUCTION
+        )                                                      # (B, H, Na//2)
+        hubert_out = hubert_out.transpose(1, 2)                # (B, Na//2, H)
+
+        # ---------- build *matching* attention-mask -------------------------
         if attention_mask is not None:
-            output_attention_mask = self._downsample_attention_mask(attention_mask, output_length)
+            # first down-sample by HuBERT strides (→ 250), *then* by our pooling
+            mask_ds = self._downsample_attention_mask(
+                attention_mask, hubert_out.size(1) * REDUCTION
+            )                               # still length 250
+            output_attention_mask = mask_ds[:, ::REDUCTION]    # length 125
         else:
-            
-            batch_size = hubert_output.size(0)
+            B, Na_r, _ = hubert_out.shape
             output_attention_mask = torch.ones(
-                batch_size, output_length,
-                dtype=torch.long,
-                device=hubert_output.device
+                B, Na_r, dtype=torch.long, device=hubert_out.device
             )
-        audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))
-        audio_feats = F.normalize(audio_feats, dim=-1)
-        return audio_feats, output_attention_mask
-    
+
+        # ---------- projection + L2-normalise -------------------------------
+        feats = self.layer_norm(self.projection1(hubert_out))
+        feats = self.projection2(feats)
+        feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
+
+        return feats, output_attention_mask
+
+            
     def unfreeze_hubert(self):
         """Unfreeze HuBERT parameters for fine-tuning after warmup period."""
         if self.hubert_frozen:

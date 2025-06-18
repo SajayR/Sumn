@@ -26,6 +26,7 @@ class VeSVisualizer:
         self,
         out_dir: str | Path = "visualizations",
         token_hz: int = 50,                 # 1 / 0.02 s
+        reduction: int = 2,
         alpha: float = 0.25,                # heat-map opacity
         max_samples_per_call: int = 4,
     ):
@@ -34,6 +35,8 @@ class VeSVisualizer:
 
         self.fps = token_hz                 # video FPS
         self.alpha = alpha
+        self.reduction = reduction
+        self.samples_per_token = 320 * reduction  # 16 kHz × 20 ms × r
         self.max_samples_per_call = max_samples_per_call
 
         # ImageNet mean / std for un-normalising
@@ -96,7 +99,7 @@ class VeSVisualizer:
         token_sims = token_sims[:valid_tok]                  # (valid_tok, Nv)
 
         # audio: 320 samples per token @16 kHz
-        expected_samples = valid_tok * 320
+        expected_samples = valid_tok * self.samples_per_token
         audio_np = audio_np[:expected_samples]
 
         # --- collect frames for matplotlib visualization -------------------
