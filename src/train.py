@@ -54,10 +54,12 @@ class VeSTrainer:
         #self.vis_out_dir.mkdir(parents=True, exist_ok=True)
         
         # Initialize visualizer
+        REDUCTION = 2
         self.visualizer = VeSVisualizer(
             out_dir=self.output_dir / "viz",
-            token_hz=50,            # 20 ms per token
+            token_hz=25,            # 20 ms per token
             max_samples_per_call=20,
+            reduction=REDUCTION,
         )
 
         
@@ -98,7 +100,7 @@ class VeSTrainer:
         # Initialize model with staged training if configured
         freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
         self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
-        self.model.visual_embedder.fuse_lora()
+        #self.model.visual_embedder.fuse_lora()
         #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
         self.model.train()
         
@@ -349,6 +351,8 @@ class VeSTrainer:
                         "train/learning_rate": current_lr,
                         "train/epoch": epoch,
                         "train/step": self.global_step,
+                        "bias": self.model.bias.item(),
+                        "logit_scale": self.model.logit_scale.item(),
                     }, step=self.global_step)
 
                 if self.global_step % self.checkpoint_every_steps == 0 and self.global_step != 0:
@@ -410,8 +414,8 @@ if __name__ == "__main__":
         },
         "wandb": {
             "enabled": True,
-            "project": "VeS",
-            "name": "Staged_Training",
+            "project": "FuckVes",
+            "name": "testing",
             "log_freq": 1, 
             "watch_model": False,  
         },

@@ -63,73 +63,75 @@ class AudioEmbedder(nn.Module):
         return downsample_factor
     
     def _downsample_attention_mask(self, attention_mask: torch.Tensor, target_length: int) -> torch.Tensor:
-        """
-        Downsample the attention mask to match the output sequence length.
-        
-        Args:
-            attention_mask: (B, L) input attention mask
-            target_length: desired output length
+            """
+            Downsample the attention mask to match the output sequence length.
             
-        Returns:
-            downsampled_mask: (B, target_length) output attention mask
-        """
-        if attention_mask is None:
-            return None
+            Args:
+                attention_mask: (B, L) input attention mask
+                target_length: desired output length
+                
+            Returns:
+                downsampled_mask: (B, target_length) output attention mask
+            """
+            if attention_mask is None:
+                return None
+                
+            batch_size = attention_mask.size(0)
+            input_length = attention_mask.size(1)
             
-        batch_size = attention_mask.size(0)
-        input_length = attention_mask.size(1)
-        
-        # Method 1: Simple downsampling by taking every nth element
-        # This works well when the downsampling is uniform
-        if input_length // self.downsample_factor == target_length:
-            # Perfect match - use stride-based downsampling
-            downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
-        else:
-            # Method 2: Adaptive pooling to handle any length mismatch
-            # Reshape to (B, 1, L) for adaptive pooling
-            mask_float = attention_mask.float().unsqueeze(1)
+            # Method 1: Simple downsampling by taking every nth element
+            # This works well when the downsampling is uniform
+            if input_length // self.downsample_factor == target_length:
+                # Perfect match - use stride-based downsampling
+                downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
+            else:
+                # Method 2: Adaptive pooling to handle any length mismatch
+                # Reshape to (B, 1, L) for adaptive pooling
+                mask_float = attention_mask.float().unsqueeze(1)
+                
+                # Use adaptive average pooling to downsample
+                downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
+                
+                # Convert back to binary mask (threshold at 0.5)
+                downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
             
-            # Use adaptive average pooling to downsample
-            downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
+            return downsampled_mask
             
-            # Convert back to binary mask (threshold at 0.5)
-            downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
-        
-        return downsampled_mask
-        
-    def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            audio_input: (B, L) processed audio features
-            attention_mask: (B, L) attention mask for audio tokens (input length)
-            
-        Returns:
-            audio_feats: (B, Na, D) where Na is the OUTPUT sequence length
-            output_attention_mask: (B, Na) attention mask for output tokens
-        """
-        hubert_outputs = self.hubert(
-            audio_input, 
+    def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        # ---------- HuBERT encoder ------------------------------------------
+        hubert_out = self.hubert(
+            audio_input,
             attention_mask=attention_mask,
-            return_dict=True
-        )
-        
-        hubert_output = hubert_outputs.last_hidden_state  # (B, Na, H)
-        output_length = hubert_output.size(1)
-        
-        # Downsample the attention mask to match output length
+            return_dict=True,
+        ).last_hidden_state                    # (B, Na, H)
+
+        # ---------- temporal pooling (REDUCTION = 2) ------------------------
+        REDUCTION = 2
+        hubert_out = hubert_out.transpose(1, 2)                # (B, H, Na)
+        hubert_out = F.avg_pool1d(
+            hubert_out, kernel_size=REDUCTION, stride=REDUCTION
+        )                                                      # (B, H, Na//2)
+        hubert_out = hubert_out.transpose(1, 2)                # (B, Na//2, H)
+
+        # ---------- build *matching* attention-mask -------------------------
         if attention_mask is not None:
-            output_attention_mask = self._downsample_attention_mask(attention_mask, output_length)
+            # first down-sample by HuBERT strides (→ 250), *then* by our pooling
+            mask_ds = self._downsample_attention_mask(
+                attention_mask, hubert_out.size(1) * REDUCTION
+            )                               # still length 250
+            output_attention_mask = mask_ds[:, ::REDUCTION]    # length 125
         else:
-            
-            batch_size = hubert_output.size(0)
+            B, Na_r, _ = hubert_out.shape
             output_attention_mask = torch.ones(
-                batch_size, output_length,
-                dtype=torch.long,
-                device=hubert_output.device
+                B, Na_r, dtype=torch.long, device=hubert_out.device
             )
-        audio_feats = self.projection2(self.layer_norm(self.projection1(hubert_output)))
-        audio_feats = F.normalize(audio_feats, dim=-1)
-        return audio_feats, output_attention_mask
+
+        # ---------- projection + L2-normalise -------------------------------
+        feats = self.layer_norm(self.projection1(hubert_out))
+        feats = self.projection2(feats)
+        feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
+
+        return feats, output_attention_mask
     
     def unfreeze_hubert(self):
         """Unfreeze HuBERT parameters for fine-tuning after warmup period."""
@@ -245,7 +247,7 @@ class VeS(nn.Module):
         self.bias = nn.Parameter(torch.tensor(-10.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.tv_weight = 0.0001
+        self.tv_weight = 0.0
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -325,7 +327,7 @@ class VeS(nn.Module):
         l_nonneg = neg_sims.pow(2).mean()
 
         # Early-exit if temporal smoothing is disabled
-        if getattr(self, "tv_weight", 0.0) == 0:
+        if getattr(self, "tv_weight", 0.0) == 0.0:
             return l_nonneg
 
         # ----------------------------------------------------------
@@ -387,13 +389,13 @@ class VeS(nn.Module):
         logits        = clip_sims + self.bias      # broadcast learnable bias b
         pairwise_loss = -F.logsigmoid(labels * logits).mean()
 
-        #scaling loss for bf16 stability
+        #scaling loss for bf16 stability (if needed later)
         #pairwise_loss = pairwise_loss * 10
 
         # optional regularisation (unchanged from the original implementation)
-        #reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
+        reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
 
-        total_loss = pairwise_loss# + reg_loss
+        total_loss = pairwise_loss + reg_loss
 
         return total_loss
     
@@ -433,6 +435,9 @@ class VeS(nn.Module):
         """Unfreeze HuBERT encoder for second stage of training."""
         self.audio_embedder.unfreeze_hubert()
 
+
+
+
 def dummy_inputs():
     """Fixture to create dummy audio and image inputs."""
     batch_size = 2
@@ -441,6 +446,10 @@ def dummy_inputs():
     images = torch.randn(batch_size, 3, 224, 224)
     
     return audio_input, images
+
+
+
+
 if __name__ == "__main__":
     print("Testing VeS with random inputs...")
     
