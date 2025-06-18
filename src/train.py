@@ -247,12 +247,6 @@ class VeSTrainer:
     # Training loop
     # -------------------------------------------------------------------------
 
-    # -------------------------------------------------------------------------
-# VeSTrainer.train  —  Grad-Cache edition
-# -------------------------------------------------------------------------
-    # ---------------------------------------------------------------------------
-#                         Grad-Cache TRAIN LOOP
-# ---------------------------------------------------------------------------
     def train(self):
         self.print_trainable_params("(Initial State)")
 
@@ -270,6 +264,8 @@ class VeSTrainer:
             for step, batch in pbar:
                 if step >= self.steps_per_epoch:
                     break
+
+                self.optimizer.zero_grad(set_to_none=True)
 
                 # --------------------- HuBERT staged training ----------------
                 if (not self.hubert_unfrozen and
@@ -313,12 +309,15 @@ class VeSTrainer:
                 grad_F, grad_G = F.grad.detach(), G.grad.detach()
 
                 # --------------------- Grad-Cache STEP-2  (enc back) ---------
-                self.optimizer.zero_grad(set_to_none=True)
+                #self.optimizer.zero_grad(set_to_none=True)
                 _run_audio_backward(self.model, batch, grad_F, micro_bs, self.device)
                 _run_vision_backward(self.model, batch, grad_G, micro_bs, self.device)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
+                self.model.logit_scale.grad = None
+                self.model.bias.grad = None
+
                 self.scheduler.step()
 
                 # --------------------- bookkeeping ---------------------------
@@ -333,6 +332,8 @@ class VeSTrainer:
                         "grad_norm":  float(grad_norm),
                         "train/step": self.global_step,
                         "train/epoch":epoch,
+                        "logit_scale": self.model.logit_scale.detach(),
+                        "bias": self.model.bias.detach(),
                     }, step=self.global_step)
 
                 # ---- visualiser needs only diagonal token sims --------------
@@ -436,7 +437,7 @@ if __name__ == "__main__":
             "use_amp": True,
             
             # Data settings
-            "micro_batch_size": 32,        # fits comfortably in GPU RAM
+            "micro_batch_size":48,        # fits comfortably in GPU RAM
             "batch_size": 256,
             "num_workers": 4,
             
@@ -462,9 +463,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
-            "project": "VeS",
-            "name": "Grad-Cache",
+            "enabled": True,
+            "project": "VeS-Cache",
+            "name": "MidMode",
             "log_freq": 1, 
             "watch_model": False,  
         },
