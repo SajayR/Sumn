@@ -13,6 +13,7 @@ from torch.utils.data import IterableDataset
 from PIL import Image as PILImage
 import random
 import torchvision.transforms as transforms
+import torchaudio
 
 def process_image(image_path, crop_strategy="pad_square", target_size=224):
     """
@@ -79,12 +80,13 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
     return transform(image)
 
 
-class VAAPairedDataset(IterableDataset):
+# Change from IterableDataset to Dataset
+class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
     
     def __init__(self, 
-                 completed_audio_path="/bigchungus/CisStuff/VeS/dataset/completed_audio_files.txt",
+                 completed_audio_path="/bigchungus/CisStuff/VeS/ssddataset/completed_audio_files.txt",
                  json_mapping_path="/bigchungus/CisStuff/VeS/dataset/vaani_hindi_only.json",
-                 data_base_path="/bigchungus/data",
+                 data_base_path="/home/cis/Vaani-Data",
                  crop_strategy="pad_square", 
                  target_size=224,
                  max_audio_duration=5.0,
@@ -119,71 +121,101 @@ class VAAPairedDataset(IterableDataset):
                 self.valid_audio_files.append(audio_file)
         
         print(f"Found {len(self.valid_audio_files)} valid audio files with image mappings")
-        
-        # Shuffle the list for better training
-        random.shuffle(self.valid_audio_files)
+
+        # In __init__:
+        # Check available backends
+        if 'sox_io' in torchaudio.list_audio_backends():
+            torchaudio.set_audio_backend('sox_io')  # Fast for many formats
+        elif 'soundfile' in torchaudio.list_audio_backends():
+            torchaudio.set_audio_backend('soundfile')  # Good for WAV/FLAC
+                
+                # DON'T shuffle here - let DataLoader handle it
+        # random.shuffle(self.valid_audio_files)  ← Remove this line
 
     def __len__(self):
         return len(self.valid_audio_files)
     
-    def __iter__(self):
-        for audio_file in self.valid_audio_files:
-            try:
-                # Get corresponding image file
-                image_file = self.audio_to_image_map[audio_file]
+    def __getitem__(self, idx):  # ← Changed from __iter__
+        # Get the specific audio file at this index
+        audio_file = self.valid_audio_files[idx]
+        
+        try:
+            # Get corresponding image file
+            image_file = self.audio_to_image_map[audio_file]
+            
+            # Construct full paths
+            audio_path = os.path.join(self.data_base_path, audio_file)
+            image_path = os.path.join(self.data_base_path, image_file)
+            
+            # Check if files exist
+            if not os.path.exists(audio_path):
+                # Return a different valid sample or raise exception
+                print(f"Warning: Audio file not found: {audio_path}")
+                # Option 1: Return next valid sample
+                return self.__getitem__((idx + 1) % len(self))
+                # Option 2: Raise exception (not recommended)
+                # raise FileNotFoundError(f"Audio file not found: {audio_path}")
                 
-                # Construct full paths
-                audio_path = os.path.join(self.data_base_path, audio_file)
-                image_path = os.path.join(self.data_base_path, image_file)
-                
-                # Check if files exist
-                if not os.path.exists(audio_path):
-                    print(f"Warning: Audio file not found: {audio_path}")
-                    continue
-                if not os.path.exists(image_path):
-                    print(f"Warning: Image file not found: {image_path}")
-                    continue
-                
-                # Load and process audio
-                audio_array, sr = librosa.load(audio_path, sr=self.sampling_rate)
-                
-                # Truncate or pad audio to max duration
-                max_samples = int(self.max_audio_duration * self.sampling_rate)
-                original_length = len(audio_array)
-                
-                if len(audio_array) > max_samples:
-                    # Random crop if longer than max duration
-                    start_idx = random.randint(0, len(audio_array) - max_samples)
-                    audio_array = audio_array[start_idx:start_idx + max_samples]
-                    # All samples are valid after cropping
-                    attention_mask = np.ones(max_samples, dtype=np.float32)
-                else:
-                    # Pad with zeros if shorter than max duration
-                    padding = max_samples - len(audio_array)
-                    audio_array = np.pad(audio_array, (0, padding), mode='constant')
-                    # Create attention mask: 1 for real audio, 0 for padding
-                    attention_mask = np.concatenate([
-                        np.ones(original_length, dtype=np.float32),
-                        np.zeros(padding, dtype=np.float32)
-                    ])
-                
-                # Process image
-                image_tensor = process_image(image_path, self.crop_strategy, self.target_size)
-                
-                # Convert audio and mask to tensors
-                audio_tensor = torch.from_numpy(audio_array).float()
-                attention_mask_tensor = torch.from_numpy(attention_mask).float()
-                
-                yield {
-                    "audio": audio_tensor,  # torch.Tensor [T]
-                    "audio_attention_mask": attention_mask_tensor,  # torch.Tensor [T]
-                    "sampling_rate": self.sampling_rate,  # int
-                    "image": image_tensor,  # torch.Tensor [3, 224, 224]
-                    "audio_path": audio_path,
-                    "image_path": image_path,
-                }
-                
-            except Exception as e:
-                print(f"Error processing {audio_file}: {e}")
-                continue
+            if not os.path.exists(image_path):
+                print(f"Warning: Image file not found: {image_path}")
+                return self.__getitem__((idx + 1) % len(self))
+            
+            # Load and process audio
+            waveform, sr = torchaudio.load(audio_path)
+            # waveform shape: [channels, time]
+            
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # Resample if needed
+            if sr != self.sampling_rate:
+                if self.resampler is None or self.resampler.orig_freq != sr:
+                    self.resampler = T.Resample(sr, self.sampling_rate)
+                waveform = self.resampler(waveform)
+            
+            # Remove channel dimension to match librosa format [time]
+            audio_tensor = waveform.squeeze(0)
+            
+            # Rest of your processing
+            max_samples = int(self.max_audio_duration * self.sampling_rate)
+            original_length = audio_tensor.shape[0]
+            
+            if audio_tensor.shape[0] > max_samples:
+                # Random crop if longer than max duration
+                start_idx = random.randint(0, audio_tensor.shape[0] - max_samples)
+                audio_tensor = audio_tensor[start_idx:start_idx + max_samples]
+                attention_mask = torch.ones(max_samples, dtype=torch.float32)
+            else:
+                # Pad with zeros if shorter than max duration
+                padding = max_samples - audio_tensor.shape[0]
+                audio_tensor = torch.nn.functional.pad(audio_tensor, (0, padding))
+                attention_mask = torch.cat([
+                    torch.ones(original_length, dtype=torch.float32),
+                    torch.zeros(padding, dtype=torch.float32)
+                ])
+            
+            image_tensor = process_image(image_path, self.crop_strategy, self.target_size)
+            
+            return {
+                "audio": audio_tensor,
+                "audio_attention_mask": attention_mask,
+                "sampling_rate": self.sampling_rate,
+                "image": image_tensor,
+                "audio_path": audio_path,
+                "image_path": image_path,
+            }
+            
+        except Exception as e:
+            print(f"Error processing {audio_file}: {e}")
+            # Return next valid sample
+            return self.__getitem__((idx + 1) % len(self))
 
+
+
+'''
+Loaded 2540518 completed audio files
+Loading JSON mapping...
+Loaded 6795660 audio-image mappings
+Found 2540518 valid audio files with image mappings
+'''

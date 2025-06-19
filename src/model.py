@@ -29,14 +29,13 @@ class AudioEmbedder(nn.Module):
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
         self.downsample_factor = self._compute_downsample_factor()
-        #print(f"Downsample factor: {self.downsample_factor}")
-        
-        # Initially freeze HuBERT parameters if requested (for staged training)
+\
+        # freeze HuBERT parameters if requested (for staged training)
         self.hubert_frozen = freeze_hubert_initially
         for param in self.hubert.parameters():
             param.requires_grad = not freeze_hubert_initially
             
-        # Projection layers are always trainable from the start
+        # Projection always trainable 
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
@@ -80,7 +79,7 @@ class AudioEmbedder(nn.Module):
             input_length = attention_mask.size(1)
             
             # Method 1: Simple downsampling by taking every nth element
-            # This works well when the downsampling is uniform
+            # works well when downsampling is uniform
             if input_length // self.downsample_factor == target_length:
                 # Perfect match - use stride-based downsampling
                 downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
@@ -98,14 +97,12 @@ class AudioEmbedder(nn.Module):
             return downsampled_mask
             
     def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor | None = None):
-        # ---------- HuBERT encoder ------------------------------------------
         hubert_out = self.hubert(
             audio_input,
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state                    # (B, Na, H)
 
-        # ---------- temporal pooling (REDUCTION = 2) ------------------------
         REDUCTION = 2
         hubert_out = hubert_out.transpose(1, 2)                # (B, H, Na)
         hubert_out = F.avg_pool1d(
@@ -113,9 +110,8 @@ class AudioEmbedder(nn.Module):
         )                                                      # (B, H, Na//2)
         hubert_out = hubert_out.transpose(1, 2)                # (B, Na//2, H)
 
-        # ---------- build *matching* attention-mask -------------------------
         if attention_mask is not None:
-            # first down-sample by HuBERT strides (→ 250), *then* by our pooling
+            # first down-sample by HuBERT strides (→ 250), then by our pooling
             mask_ds = self._downsample_attention_mask(
                 attention_mask, hubert_out.size(1) * REDUCTION
             )                               # still length 250
@@ -125,12 +121,9 @@ class AudioEmbedder(nn.Module):
             output_attention_mask = torch.ones(
                 B, Na_r, dtype=torch.long, device=hubert_out.device
             )
-
-        # ---------- projection + L2-normalise -------------------------------
         feats = self.layer_norm(self.projection1(hubert_out))
         feats = self.projection2(feats)
         feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
-
         return feats, output_attention_mask
     
     def unfreeze_hubert(self):
@@ -174,9 +167,7 @@ class VisionEncoder(nn.Module):
         )
 
         self.model = get_peft_model(self.model, lora_config)
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        total_params = sum(p.numel() for p in self.model.parameters())
-        print(f"VisionEncoder - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
+
         self.projection1 = nn.Linear(self.model.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
@@ -285,22 +276,19 @@ class VeS(nn.Module):
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
-        # Full token-level sim
+        # token-level sim
         token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
         token_sims = token_sims * torch.exp(self.logit_scale)       # scale by learned temp
 
-        # ------------------------------------------------------------
         # 1)  audio → visual • max over patches, mean over tokens
-        # ------------------------------------------------------------
+
         a2v_max  = token_sims.max(dim=3).values                      # (B, B, Na)
         a_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
         a2v_sum  = (a2v_max * a_mask).sum(dim=2)                     # (B, B)
         valid_a  = a_mask.sum(dim=2).clamp(min=1e-5)  # Slightly larger epsilon for bf16
         a2v_clip = a2v_sum / valid_a                                 # (B, B)
 
-        # ------------------------------------------------------------
         # 2)  visual → audio • max over tokens, mean over patches
-        # ------------------------------------------------------------
         v2a_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
         v2a_clip = v2a_max.mean(dim=2)                               # (B, B)
 
@@ -320,19 +308,15 @@ class VeS(nn.Module):
         • l_tv      — total-variation smoothing on the *positive* pair
                     (diagonal b → b) along the audio-token axis
         """
-        # ----------------------------------------------------------
-        # (1) non-negativity pressure  (unchanged)
-        # ----------------------------------------------------------
+        # (1) non-negativity pressure 
         neg_sims = token_sims.clamp(min=-20.0, max=0.0)
         l_nonneg = neg_sims.pow(2).mean()
 
         # Early-exit if temporal smoothing is disabled
         if getattr(self, "tv_weight", 0.0) == 0.0:
             return l_nonneg
-
-        # ----------------------------------------------------------
-        # (2) temporal-variation (TV) smoothing on the diagonal
-        # ----------------------------------------------------------
+      
+        # (2) temporal-variation (TV) smoothing on diagonal
         B = token_sims.size(0)
         device = token_sims.device
 
@@ -350,7 +334,6 @@ class VeS(nn.Module):
         else:
             l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
 
-        # ----------------------------------------------------------
         return l_nonneg + self.tv_weight * l_tv
 
 
@@ -452,16 +435,14 @@ def dummy_inputs():
 
 if __name__ == "__main__":
     print("Testing VeS with random inputs...")
-    
-    # Test with staged training (HuBERT frozen initially)
+
     print("\n=== Testing with HuBERT frozen (Stage 1) ===")
     model = VeS(freeze_hubert_initially=True).to("cuda")
 
     audio_input, images = dummy_inputs()
     audio_input = audio_input.to("cuda")
     images = images.to("cuda")
-    
-    # Count trainable params before unfreezing
+
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params (Stage 1): {trainable_before:,}")
     
@@ -469,8 +450,7 @@ if __name__ == "__main__":
     print(f"Visual features shape: {outputs['visual_feats'].shape}")
     print(f"Audio features shape: {outputs['audio_feats'].shape}")
     print(f"Clip similarities shape: {outputs['clip_sims'].shape}")
-    
-    # Test unfreezing
+
     print("\n=== Testing HuBERT unfreezing (Stage 2) ===")
     model.unfreeze_hubert()
     

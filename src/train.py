@@ -23,6 +23,9 @@ import time
 from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
+torch.cuda.set_per_process_memory_fraction(0.95) 
+#torch.backends.cuda.matmul.allow_tf32 = True
+
 
 
 class VeSTrainer:
@@ -50,9 +53,7 @@ class VeSTrainer:
 
         self.output_dir = Path(self.cfg_train.get("output_dir", "checkpoints"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        #self.vis_out_dir = self.output_dir / "visualizations"
-        #self.vis_out_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Initialize visualizer
         REDUCTION = 2
         self.visualizer = VeSVisualizer(
@@ -62,12 +63,8 @@ class VeSTrainer:
             reduction=REDUCTION,
         )
 
-        
-        # ----------------------------- wandb -------------------------------
         self.use_wandb = self.cfg_wandb.get("enabled", False)
-        
-        
-        # ----------------------------- logging ----------------------------
+
         logging.basicConfig(
             filename=str(self.output_dir / "training.log"),
             level=logging.INFO,
@@ -75,36 +72,26 @@ class VeSTrainer:
         )
         self.logger = logging.getLogger(__name__)
 
-
-        # ----------------------------- data --------------------------------
-        #self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
-        #print("Initializing dataset...get ready bitches")
-
-        # Get data configuration
         self.cfg_data = config.get("data", {})
         dataset = VAAPairedDataset()
 
         self.dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size,
-            #collate_fn=make_vaani_collate_fn(self.processor),
-            num_workers=self.cfg_train.get("num_workers", 4),
+            num_workers=12,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=True,
             drop_last=True,
             prefetch_factor=6,
+            shuffle=True,
         )
         self.steps_per_epoch = len(self.dataloader)
         
-        # ----------------------------- model/optim -------------------------
-        # Initialize model with staged training if configured
         freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
         self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
         #self.model.visual_embedder.fuse_lora()
         #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
         self.model.train()
-        
-        # Track if we've unfrozen HuBERT
         self.hubert_unfrozen = not freeze_hubert
 
         
@@ -112,8 +99,7 @@ class VeSTrainer:
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
         #self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
         
-        # Calculate total steps for cosine schedule with warmup
-        total_steps = len(self.dataloader)#self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
+        total_steps = len(self.dataloader)*self.num_epochs // self.gradient_accumulation
         warmup_steps = int(self.cfg_train.get("warmup_ratio", 0.1) * total_steps)
         
         self.scheduler = get_cosine_schedule_with_warmup(
@@ -126,17 +112,14 @@ class VeSTrainer:
         
         print(f"Scheduler setup: {total_steps} total steps, {warmup_steps} warmup steps")
 
-        # ----------------------------- misc --------------------------------
         self.global_step = 0
         self.best_loss   = float("inf")
         if self.use_wandb:
             self._init_wandb(config)
-            # Log initial training stage
             wandb.log({
                 "train/stage": 1 if freeze_hubert else 0,  # Stage 1: LoRA + projections only, Stage 0: all trainable
                 "train/hubert_unfrozen": 0 if freeze_hubert else 1,
             }, step=0)
-        # wandb model watching (after model and optimizer are created)
         if self.use_wandb and self.cfg_wandb.get("watch_model", False):
             wandb.watch(self.model, log="all", log_freq=self.cfg_wandb.get("log_freq", 10))
 
@@ -154,6 +137,7 @@ class VeSTrainer:
             "device": str(self.device),
             "model_config": config.get("model", {}),
             "data_config": config.get("data", {}),
+            #"num_workers": self.cfg_train.get("num_workers", 4),
         }
         
         wandb.init(
@@ -231,9 +215,6 @@ class VeSTrainer:
         print(f"Total Trainable: {total_trainable:,} / {total_params:,} ({100 * total_trainable / total_params:.2f}%)")
         print("=== End Status ===\n")
 
-    # -------------------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------------------
 
     def train(self):
         # Print initial parameter status
@@ -247,14 +228,16 @@ class VeSTrainer:
             pbar = tqdm(enumerate(self.dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
 
             accumulation_counter = 0
-            print("\n=== LoRA Parameter Verification ===")
+            '''print("\n=== LoRA Parameter Verification ===")
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
                     print(f"TRAINABLE: {name} - {param.numel():,} params")
                 elif 'lora_' in name:
                     print(f"WARNING: LoRA param not trainable: {name}")
-            print("=== End Verification ===\n")
+            print("=== End Verification ===\n")'''
             for step, batch in pbar:
+                #if step<200:
+                #    continue
                 if step >= self.steps_per_epoch:
                     break  # bound the epoch length for IterableDataset
 
@@ -269,6 +252,10 @@ class VeSTrainer:
                     # Recreate optimizer with newly unfrozen parameters
                     old_lr = self.scheduler.get_last_lr()[0] if hasattr(self, 'scheduler') else self.learning_rate
                     self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(old_lr))
+                    
+                    # Set initial_lr for all param groups (required for scheduler)
+                    for group in self.optimizer.param_groups:
+                        group['initial_lr'] = self.learning_rate
                     
                     # Recreate scheduler with the same state
                     total_steps = self.num_epochs * self.steps_per_epoch // self.gradient_accumulation
@@ -308,7 +295,7 @@ class VeSTrainer:
                     grad_norm, param_count = self.compute_gradient_norm()
                     
                     # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -389,7 +376,7 @@ if __name__ == "__main__":
             
             # Data settings
             "batch_size": 44,
-            "num_workers": 8,
+            "num_workers": 12,
             
             # Training schedule
             "num_epochs": 3,
@@ -405,7 +392,7 @@ if __name__ == "__main__":
             "output_dir": "checkpoints",
             "checkpoint_every_steps": 2000,
             
-            "viz_every_steps": 5000,
+            "viz_every_steps": 2500,
             "viz_batch_limit": 32,
         },
         "logging": {
@@ -414,14 +401,13 @@ if __name__ == "__main__":
         },
         "wandb": {
             "enabled": True,
-            "project": "FuckVes",
-            "name": "testing",
+            "project": "VeS-Training",
+            "name": "IdkLetsItRun",
             "log_freq": 1, 
             "watch_model": False,  
         },
     }
-    
-    print("Using hardcoded configuration")
+
     trainer = VeSTrainer(config)
     print("trainer initialized")
     trainer.train()
