@@ -14,6 +14,7 @@ from PIL import Image as PILImage
 import random
 import torchvision.transforms as transforms
 import torchaudio
+import torchaudio.transforms as T
 
 def process_image(image_path, crop_strategy="pad_square", target_size=224):
     """
@@ -69,11 +70,23 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
         raise ValueError(f"Unknown crop_strategy: {crop_strategy}")
     
 
-    transform = transforms.Compose([
+    '''transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],  
             std=[0.229, 0.224, 0.225]  
+        )
+    ])'''
+
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(degrees=10),
+       # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
         )
     ])
     
@@ -90,7 +103,8 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
                  crop_strategy="pad_square", 
                  target_size=224,
                  max_audio_duration=5.0,
-                 sampling_rate=16000):
+                 sampling_rate=16000,
+                 debug=False):
         super().__init__()
         
         self.data_base_path = data_base_path
@@ -98,6 +112,7 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
         self.target_size = target_size
         self.max_audio_duration = max_audio_duration
         self.sampling_rate = sampling_rate
+        self.resampler = None  # Initialize resampler as None
         
         print("Loading completed audio files list...")
         with open(completed_audio_path, 'r') as f:
@@ -219,3 +234,13 @@ Loading JSON mapping...
 Loaded 6795660 audio-image mappings
 Found 2540518 valid audio files with image mappings
 '''
+
+
+if __name__ == "__main__":
+    dataset = VAAPairedDataset(debug=True)
+    import time
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True, prefetch_factor=6)
+    for batch in dataloader:
+        pass
+
+        

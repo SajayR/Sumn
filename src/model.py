@@ -17,12 +17,14 @@ from peft import (
     get_peft_model,
     TaskType,
 )
+import torch._dynamo
 
 class AudioEmbedder(nn.Module):
 
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert", freeze_hubert_initially=True):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
+        self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
         self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
@@ -42,7 +44,8 @@ class AudioEmbedder(nn.Module):
             param.requires_grad = True
         for param in self.layer_norm.parameters():
             param.requires_grad = True
-            
+
+        
         if freeze_hubert_initially:
             print(f"AudioEmbedder initialized with HuBERT FROZEN")
         else:
@@ -232,8 +235,7 @@ class VeS(nn.Module):
         self.visual_embedder = VisionEncoder()  
         self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
 
-        self.audio_embedder = AudioEmbedder(freeze_hubert_initially=freeze_hubert_initially)
-        self.audio_processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
+        self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960", freeze_hubert_initially=freeze_hubert_initially)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
         self.bias = nn.Parameter(torch.tensor(-10.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

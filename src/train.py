@@ -18,6 +18,8 @@ import gc
 import warnings
 from pathlib import Path
 import time
+import random
+import pickle
 #import bitsandbytes as bnb
 #from splus import SPlus
 from viz import VeSVisualizer
@@ -25,7 +27,7 @@ warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
 torch.cuda.set_per_process_memory_fraction(0.95) 
 #torch.backends.cuda.matmul.allow_tf32 = True
-
+torch.backends.cudnn.benchmark = True
 
 
 class VeSTrainer:
@@ -50,6 +52,10 @@ class VeSTrainer:
         self.visualize_every_steps      = self.cfg_train.get("visualize_every_steps", 10)
         self.viz_every_steps            = self.cfg_train.get("viz_every_steps", 10)
         self.hubert_unfreeze_steps      = self.cfg_train.get("hubert_unfreeze_steps", None)
+        
+        # Set deterministic seed for reproducible data ordering
+        self.data_seed = self.cfg_train.get("data_seed", 42)
+        self.set_seeds(self.data_seed)
 
         self.output_dir = Path(self.cfg_train.get("output_dir", "checkpoints"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -75,6 +81,18 @@ class VeSTrainer:
         self.cfg_data = config.get("data", {})
         dataset = VAAPairedDataset()
 
+        # Create DataLoader with deterministic worker seeding
+        def worker_init_fn(worker_id):
+            # Each worker gets a unique but deterministic seed
+            worker_seed = self.data_seed + worker_id
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
+
+        # Create generator for deterministic shuffling
+        self.data_generator = torch.Generator()
+        self.data_generator.manual_seed(self.data_seed)
+
         self.dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -84,18 +102,21 @@ class VeSTrainer:
             drop_last=True,
             prefetch_factor=6,
             shuffle=True,
+            generator=self.data_generator, 
+            worker_init_fn=worker_init_fn, 
+            pin_memory_device="cuda" 
         )
         self.steps_per_epoch = len(self.dataloader)
         
         freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
         self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
         #self.model.visual_embedder.fuse_lora()
-        #self.model = torch.compile(self.model, mode="max-autotune")#, fullgraph=True, dynamic=False)
+        self.model = torch.compile(self.model, mode="reduce-overhead")#, fullgraph=True)#, dynamic=False)
         self.model.train()
         self.hubert_unfrozen = not freeze_hubert
 
         
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate))
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=float(self.learning_rate), fused=True)
         #self.optimizer = bnb.optim.Adam8bit(self.model.parameters(), lr=float(self.learning_rate)) #gives like 600 MBs in savings
         #self.optimizer = SPlus(self.model.parameters(), lr=float(self.learning_rate)) #adds like 600MBs in whatever the opposite of savings is
         
@@ -113,6 +134,7 @@ class VeSTrainer:
         print(f"Scheduler setup: {total_steps} total steps, {warmup_steps} warmup steps")
 
         self.global_step = 0
+        self.current_epoch = 0
         self.best_loss   = float("inf")
         if self.use_wandb:
             self._init_wandb(config)
@@ -122,6 +144,17 @@ class VeSTrainer:
             }, step=0)
         if self.use_wandb and self.cfg_wandb.get("watch_model", False):
             wandb.watch(self.model, log="all", log_freq=self.cfg_wandb.get("log_freq", 10))
+
+    def set_seeds(self, seed: int):
+        """Set all random seeds for reproducibility."""
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        # For deterministic CUDA operations (may impact performance)
+        #torch.backends.cudnn.deterministic = True
+        #torch.backends.cudnn.benchmark = False
+        print(f"Set all random seeds to {seed} for deterministic training")
 
     def _init_wandb(self, config: dict):
         """Initialize Weights & Biases logging."""
@@ -137,6 +170,7 @@ class VeSTrainer:
             "device": str(self.device),
             "model_config": config.get("model", {}),
             "data_config": config.get("data", {}),
+            "data_seed": self.data_seed,
             #"num_workers": self.cfg_train.get("num_workers", 4),
         }
         
@@ -171,18 +205,109 @@ class VeSTrainer:
     def _ckpt_path(self, epoch: int, step: int) -> Path:
         return self.output_dir / f"checkpoint_epoch{epoch}_step{step}.pt"
 
+    def find_latest_checkpoint(self) -> Path | None:
+        """Find the checkpoint with the highest step number in the output directory."""
+        if not self.output_dir.exists():
+            return None
+        
+        checkpoint_files = list(self.output_dir.glob("checkpoint_epoch*_step*.pt"))
+        if not checkpoint_files:
+            return None
+        
+        # Extract step numbers and find the maximum
+        latest_step = -1
+        latest_checkpoint = None
+        
+        for ckpt_file in checkpoint_files:
+            # Parse filename: checkpoint_epoch{epoch}_step{step}.pt
+            try:
+                filename = ckpt_file.stem  # Remove .pt extension
+                parts = filename.split('_')
+                step_part = next(part for part in parts if part.startswith('step'))
+                step_num = int(step_part[4:])  # Remove 'step' prefix
+                
+                if step_num > latest_step:
+                    latest_step = step_num
+                    latest_checkpoint = ckpt_file
+            except (ValueError, StopIteration, IndexError):
+                # Skip malformed filenames
+                continue
+        
+        return latest_checkpoint
+
+    def auto_resume_if_available(self) -> bool:
+        """Automatically find and load the latest checkpoint if available.
+        
+        Returns:
+            bool: True if a checkpoint was loaded, False otherwise
+        """
+        latest_checkpoint = self.find_latest_checkpoint()
+        if latest_checkpoint:
+            print(f"Found latest checkpoint: {latest_checkpoint}")
+            self.load_checkpoint(latest_checkpoint)
+            return True
+        else:
+            print("No existing checkpoints found, starting training from scratch")
+            return False
+
     def save_checkpoint(self, epoch: int, step: int):
         ckpt = {
             "epoch": epoch,
             "step": step,
+            "global_step": self.global_step,
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
+            "hubert_unfrozen": self.hubert_unfrozen,
+            "best_loss": self.best_loss,
+            # Save random states for exact resumption
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate(),
+            "data_generator_state": self.data_generator.get_state(),
+            "data_seed": self.data_seed,
         }
         temp = self._ckpt_path(epoch, step).with_suffix(".temp.pt")
         torch.save(ckpt, temp)
         temp.rename(self._ckpt_path(epoch, step))
         self.logger.info(f"Saved checkpoint – epoch {epoch}, step {step}")
+
+    def load_checkpoint(self, checkpoint_path: str | Path):
+        """Load checkpoint and restore exact training state."""
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        print(f"Loading checkpoint from {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        
+        # Restore model and training states
+        self.model.load_state_dict(ckpt["model_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state"])
+        
+        # Restore training progress
+        self.global_step = ckpt.get("global_step", ckpt["step"])
+        self.current_epoch = ckpt["epoch"]
+        self.hubert_unfrozen = ckpt.get("hubert_unfrozen", False)
+        self.best_loss = ckpt.get("best_loss", float("inf"))
+        
+        # Restore random states for deterministic continuation
+        if "torch_rng_state" in ckpt:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+        if "cuda_rng_state" in ckpt and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        if "numpy_rng_state" in ckpt:
+            np.random.set_state(ckpt["numpy_rng_state"])
+        if "python_rng_state" in ckpt:
+            random.setstate(ckpt["python_rng_state"])
+        if "data_generator_state" in ckpt:
+            self.data_generator.set_state(ckpt["data_generator_state"])
+        
+        print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+        print(f"HuBERT unfrozen: {self.hubert_unfrozen}")
+        self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
     def print_trainable_params(self, stage_name=""):
         """Print current trainable parameter status for debugging staged training."""
@@ -220,7 +345,7 @@ class VeSTrainer:
         # Print initial parameter status
         self.print_trainable_params("(Initial State)")
         
-        for epoch in range(self.num_epochs):
+        for epoch in range(self.current_epoch, self.num_epochs):
             #self.optimizer.train()
 
             epoch_losses = []
@@ -279,8 +404,8 @@ class VeSTrainer:
                             "train/stage": 2,  # Stage 2: Full model training
                         }, step=self.global_step)
 
-                audio  = batch["audio"].to(self.device)
-                images = batch["image"].to(self.device)
+                audio  = batch["audio"].to(self.device, non_blocking=True)
+                images = batch["image"].to(self.device, non_blocking=True)
                 
                 with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
                     outputs = self.model(audio, images, attention_mask=batch["audio_attention_mask"].to(self.device))
@@ -295,7 +420,8 @@ class VeSTrainer:
                     grad_norm, param_count = self.compute_gradient_norm()
                     
                     # Clip gradients
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.model.audio_embedder.hubert.parameters(), 0.5)
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -310,7 +436,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 #   periodic visualisation
                 # ---------------------------------------------------------
-                if self.global_step % self.viz_every_steps == 0:
+                if self.global_step % self.viz_every_steps == 0 and self.global_step != 0:
                     matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
@@ -348,6 +474,7 @@ class VeSTrainer:
                 self.global_step += 1
 
             # --- epoch end --------------------------------------------------
+            self.current_epoch = epoch + 1
             mean_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
             self.logger.info(f"Epoch {epoch} – mean loss {mean_loss:.4f}")
             
@@ -377,14 +504,15 @@ if __name__ == "__main__":
             # Data settings
             "batch_size": 44,
             "num_workers": 12,
+            "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 3,
+            "num_epochs": 2,
           
             
             # Optimization
             "learning_rate": 3e-4,
-            "gradient_accumulation_steps": 4,
+            "gradient_accumulation_steps": 5,
             "warmup_ratio": 0.1,  
             "hubert_unfreeze_steps": 5000,  
             
@@ -400,9 +528,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
-            "project": "VeS-Training",
-            "name": "IdkLetsItRun",
+            "enabled": False,
+            "project": "VeSsDaddy",
+            "name": "GodMode",
             "log_freq": 1, 
             "watch_model": False,  
         },
@@ -410,4 +538,12 @@ if __name__ == "__main__":
 
     trainer = VeSTrainer(config)
     print("trainer initialized")
+    
+    # Automatically resume from the latest checkpoint if available
+    resumed = trainer.auto_resume_if_available()
+    if resumed:
+        print("Resumed training from checkpoint")
+    else:
+        print("Starting fresh training")
+    
     trainer.train()
