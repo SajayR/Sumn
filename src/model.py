@@ -24,8 +24,9 @@ class AudioEmbedder(nn.Module):
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert", freeze_hubert_initially=True):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
+        #self.hubert = AutoModel.from_pretrained("facebook/wav2vec2-base")
         #self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
-        self.hubert.gradient_checkpointing_enable()
+        #self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
@@ -232,7 +233,7 @@ class VeS(nn.Module):
         super().__init__()
 
         self.visual_embedder = VisionEncoder()  
-        self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
+        #self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
 
         self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960", freeze_hubert_initially=freeze_hubert_initially)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))

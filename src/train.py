@@ -513,7 +513,7 @@ if __name__ == "__main__":
             
             # Optimization
             "learning_rate": 3e-4,
-            "gradient_accumulation_steps": 5,
+            "gradient_accumulation_steps": 4,
             "warmup_ratio": 0.1,  
             "hubert_unfreeze_steps": 2000,  
             
@@ -529,7 +529,7 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
+            "enabled": False,
             "project": "VeS-Wtf",
             "name": "WtfMode",
             "log_freq": 1, 
