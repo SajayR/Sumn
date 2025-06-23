@@ -111,7 +111,8 @@ class VeSTrainer:
         freeze_hubert = self.hubert_unfreeze_steps is not None and self.hubert_unfreeze_steps > 0
         self.model = VeS(freeze_hubert_initially=freeze_hubert).to(self.device)
         #self.model.visual_embedder.fuse_lora()
-        self.model = torch.compile(self.model, mode="reduce-overhead")#, fullgraph=True)#, dynamic=False)
+        #torch._dynamo.reset()
+        #self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=False)#, fullgraph=True)#, dynamic=False)
         self.model.train()
         self.hubert_unfrozen = not freeze_hubert
 
@@ -502,19 +503,19 @@ if __name__ == "__main__":
             "use_amp": True,
             
             # Data settings
-            "batch_size": 44,
+            "batch_size": 54,
             "num_workers": 12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 2,
+            "num_epochs": 10,
           
             
             # Optimization
             "learning_rate": 3e-4,
             "gradient_accumulation_steps": 5,
             "warmup_ratio": 0.1,  
-            "hubert_unfreeze_steps": 5000,  
+            "hubert_unfreeze_steps": 2000,  
             
             # Checkpointing
             "output_dir": "checkpoints",
@@ -528,9 +529,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
-            "project": "VeSsDaddy",
-            "name": "GodMode",
+            "enabled": True,
+            "project": "VeS-Wtf",
+            "name": "WtfMode",
             "log_freq": 1, 
             "watch_model": False,  
         },

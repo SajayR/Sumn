@@ -24,14 +24,13 @@ class AudioEmbedder(nn.Module):
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert", freeze_hubert_initially=True):
         super().__init__()
         self.hubert = HubertModel.from_pretrained(hubert_name)
-        self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
+        #self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
         self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
         self.downsample_factor = self._compute_downsample_factor()
-\
         # freeze HuBERT parameters if requested (for staged training)
         self.hubert_frozen = freeze_hubert_initially
         for param in self.hubert.parameters():
@@ -98,7 +97,7 @@ class AudioEmbedder(nn.Module):
                 downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
             
             return downsampled_mask
-            
+    @torch._dynamo.disable()
     def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor | None = None):
         hubert_out = self.hubert(
             audio_input,
@@ -250,7 +249,8 @@ class VeS(nn.Module):
         Returns sim: (B, N1, N2)
         """ 
         sim = torch.bmm(feats1, feats2.transpose(1, 2))
-        return sim * torch.exp(self.logit_scale)
+        logit_scale_exp = torch.exp(self.logit_scale.clone())
+        return sim * logit_scale_exp
 
 
     def compute_all_similarities_tv(self,
@@ -280,7 +280,8 @@ class VeS(nn.Module):
 
         # token-level sim
         token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
-        token_sims = token_sims * torch.exp(self.logit_scale)       # scale by learned temp
+        logit_scale_exp = torch.exp(self.logit_scale.clone())
+        token_sims = token_sims * logit_scale_exp       # scale by learned temp
 
         # 1)  audio → visual • max over patches, mean over tokens
 
@@ -336,7 +337,7 @@ class VeS(nn.Module):
         else:
             l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
 
-        return l_nonneg + self.tv_weight * l_tv
+        return l_nonneg# + self.tv_weight * l_tv
 
 
     
