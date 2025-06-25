@@ -372,6 +372,7 @@ class VeSTrainer:
                     loss    = outputs["loss"] / self.gradient_accumulation
 
                 loss.backward()
+                #loss.detach()
                 
                 accumulation_counter += 1
 

@@ -38,7 +38,7 @@ class AudioEmbedder(nn.Module):
 
         self.hubert = AutoModel.from_pretrained(
             hubert_name,
-            quantization_config=quant_cfg,
+            #quantization_config=quant_cfg,
             device_map="auto"
         )
 
@@ -172,7 +172,7 @@ class VisionEncoder(nn.Module):
                 bnb_4bit_use_double_quant=True,
             )
 
-        self.model = AutoModel.from_pretrained('facebook/dinov2-with-registers-base', quantization_config=quantization_config, device_map="auto")
+        self.model = AutoModel.from_pretrained('facebook/dinov2-base', device_map="auto")#, quantization_config=quantization_config, device_map="auto")
         self.model.gradient_checkpointing_enable()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -242,10 +242,10 @@ class VisionEncoder(nn.Module):
         """
         #print("Dino input shape: ", x.shape)
         outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
-        patches = outputs.last_hidden_state[:,5:, :] #5 cause 1 is the cls token, 4 are registers
+        patches = outputs.last_hidden_state[:,1:, :] #5 cause 1 is the cls token, 4 are registers
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        if self.training:
-            feats = self.patch_dropout(feats, self.patch_dropout_rate)
+        #if self.training:
+            #feats = self.patch_dropout(feats, self.patch_dropout_rate)
         #feats = F.normalize(feats, dim=-1)
         #print("Dino output shape: ", feats.shape)
         return feats

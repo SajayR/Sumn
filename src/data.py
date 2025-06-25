@@ -15,6 +15,7 @@ import random
 import torchvision.transforms as transforms
 import torchaudio
 import torchaudio.transforms as T
+from transformers import AutoProcessor
 
 def process_image(image_path, crop_strategy="pad_square", target_size=224):
     """
@@ -113,6 +114,7 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
         self.max_audio_duration = max_audio_duration
         self.sampling_rate = sampling_rate
         self.resampler = None  # Initialize resampler as None
+        self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         
         print("Loading completed audio files list...")
         with open(completed_audio_path, 'r') as f:
@@ -189,26 +191,27 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
                     self.resampler = T.Resample(sr, self.sampling_rate)
                 waveform = self.resampler(waveform)
             
-            # Remove channel dimension to match librosa format [time]
             audio_tensor = waveform.squeeze(0)
             
-            # Rest of your processing
             max_samples = int(self.max_audio_duration * self.sampling_rate)
-            original_length = audio_tensor.shape[0]
             
             if audio_tensor.shape[0] > max_samples:
                 # Random crop if longer than max duration
                 start_idx = random.randint(0, audio_tensor.shape[0] - max_samples)
                 audio_tensor = audio_tensor[start_idx:start_idx + max_samples]
-                attention_mask = torch.ones(max_samples, dtype=torch.float32)
-            else:
-                # Pad with zeros if shorter than max duration
-                padding = max_samples - audio_tensor.shape[0]
-                audio_tensor = torch.nn.functional.pad(audio_tensor, (0, padding))
-                attention_mask = torch.cat([
-                    torch.ones(original_length, dtype=torch.float32),
-                    torch.zeros(padding, dtype=torch.float32)
-                ])
+
+            processed = self.processor(
+                audio_tensor.numpy(),
+                sampling_rate=self.sampling_rate,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=max_samples,
+                truncation=True,
+                return_attention_mask=True,
+            )
+            
+            audio_tensor = processed.input_values.squeeze(0)
+            attention_mask = processed.attention_mask.squeeze(0)
             
             image_tensor = process_image(image_path, self.crop_strategy, self.target_size)
             

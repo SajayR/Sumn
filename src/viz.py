@@ -25,7 +25,7 @@ class VeSVisualizer:
     def __init__(
         self,
         out_dir: str | Path = "visualizations",
-        token_hz: int = 50,                 # 1 / 0.02 s
+        token_hz: int = 25,                 # 1 / (0.02s * 2) = 25 Hz
         alpha: float = 0.25,                # heat-map opacity
         max_samples_per_call: int = 4,
         reduction: int = 2,
@@ -126,7 +126,7 @@ class VeSVisualizer:
             frame_np = self._blend(rgb_base, heat)
 
             # 🌱 timestamp overlay (bottom-left)
-            ts_sec = t * 0.02
+            ts_sec = t / self.fps
             cv2.putText(
                 frame_np,
                 f"{ts_sec:5.2f}s",
