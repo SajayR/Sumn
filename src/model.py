@@ -7,7 +7,8 @@ from transformers import (
     HubertModel, 
     AutoProcessor, 
     AutoTokenizer, 
-    AutoModel
+    AutoModel,
+    BitsAndBytesConfig
 )
 import math
 warnings.filterwarnings("ignore")
@@ -18,24 +19,46 @@ from peft import (
     TaskType,
 )
 import torch._dynamo
+from peft import prepare_model_for_kbit_training
+import os 
+os.environ["HIP_VISIBLE_DEVICES"] = "0"
+
 
 class AudioEmbedder(nn.Module):
 
-    def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert", freeze_hubert_initially=True):
+    def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
         super().__init__()
-        self.hubert = HubertModel.from_pretrained(hubert_name)
-        #self.hubert = AutoModel.from_pretrained("facebook/wav2vec2-base")
+        #self.hubert = HubertModel.from_pretrained(hubert_name)
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+        self.hubert = AutoModel.from_pretrained(
+            hubert_name,
+            quantization_config=quant_cfg,
+            device_map="auto"
+        )
+
+        lora_cfg = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+            bias="none",
+        )
+
+        self.hubert = get_peft_model(self.hubert, lora_cfg)
+
         #self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
-        #self.hubert.gradient_checkpointing_enable()
+        self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
         self.downsample_factor = self._compute_downsample_factor()
-        # freeze HuBERT parameters if requested (for staged training)
-        self.hubert_frozen = freeze_hubert_initially
-        for param in self.hubert.parameters():
-            param.requires_grad = not freeze_hubert_initially
+        print(f"Downsample factor: {self.downsample_factor}")
             
         # Projection always trainable 
         for param in self.projection1.parameters():
@@ -45,11 +68,7 @@ class AudioEmbedder(nn.Module):
         for param in self.layer_norm.parameters():
             param.requires_grad = True
 
-        
-        if freeze_hubert_initially:
-            print(f"AudioEmbedder initialized with HuBERT FROZEN")
-        else:
-            print(f"AudioEmbedder initialized with HuBERT UNFROZEN")
+        print(f"AudioEmbedder initialized with HuBERT and LoRA.")
     
     def _compute_downsample_factor(self):
         """
@@ -65,46 +84,48 @@ class AudioEmbedder(nn.Module):
         return downsample_factor
     
     def _downsample_attention_mask(self, attention_mask: torch.Tensor, target_length: int) -> torch.Tensor:
-            """
-            Downsample the attention mask to match the output sequence length.
-            
-            Args:
-                attention_mask: (B, L) input attention mask
-                target_length: desired output length
-                
-            Returns:
-                downsampled_mask: (B, target_length) output attention mask
-            """
-            if attention_mask is None:
-                return None
-                
-            batch_size = attention_mask.size(0)
-            input_length = attention_mask.size(1)
-            
-            # Method 1: Simple downsampling by taking every nth element
-            # works well when downsampling is uniform
-            if input_length // self.downsample_factor == target_length:
-                # Perfect match - use stride-based downsampling
-                downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
-            else:
-                # Method 2: Adaptive pooling to handle any length mismatch
-                # Reshape to (B, 1, L) for adaptive pooling
-                mask_float = attention_mask.float().unsqueeze(1)
-                
-                # Use adaptive average pooling to downsample
-                downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
-                
-                # Convert back to binary mask (threshold at 0.5)
-                downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
-            
-            return downsampled_mask
+        """
+        Downsample the attention mask to match the output sequence length.
+        """
+        if attention_mask is None:
+            return None
+        
+        batch_size = attention_mask.size(0)
+        input_length = attention_mask.size(1)
+        
+        # DEBUG: Add these prints
+        #print(f"DEBUG: input_length={input_length}, downsample_factor={self.downsample_factor}, target_length={target_length}")
+        #print(f"DEBUG: input_length // downsample_factor = {input_length // self.downsample_factor}")
+        
+        # Method 1: Simple downsampling by taking every nth element
+        if input_length // self.downsample_factor == target_length:
+            #print("DEBUG: Using Method 1 (stride-based)")
+            downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
+            #print(f"DEBUG: After stride downsampling: {downsampled_mask.shape}")
+        else:
+            #print("DEBUG: Using Method 2 (adaptive pooling)")
+            mask_float = attention_mask.float().unsqueeze(1)
+            downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
+            downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
+            #print(f"DEBUG: After adaptive pooling: {downsampled_mask.shape}")
+        
+        return downsampled_mask
+    
     @torch._dynamo.disable()
     def forward(self, audio_input: torch.Tensor, attention_mask: torch.Tensor | None = None):
+        # Convert input to bfloat16 to match the quantized model
+        #audio_input = audio_input.to(dtype=torch.bfloat16)
+        #if attention_mask is not None:
+        #    attention_mask = attention_mask.to(dtype=torch.bfloat16)
+        assert attention_mask is not None, "Attention mask is required"
         hubert_out = self.hubert(
             audio_input,
             attention_mask=attention_mask,
             return_dict=True,
         ).last_hidden_state                    # (B, Na, H)
+        
+        ## Convert back to float32 for projection layers
+        #hubert_out = hubert_out.to(dtype=torch.float32)
 
         REDUCTION = 2
         hubert_out = hubert_out.transpose(1, 2)                # (B, H, Na)
@@ -114,38 +135,44 @@ class AudioEmbedder(nn.Module):
         hubert_out = hubert_out.transpose(1, 2)                # (B, Na//2, H)
 
         if attention_mask is not None:
-            # first down-sample by HuBERT strides (→ 250), then by our pooling
+            #print(f"DEBUG: Original attention_mask shape: {attention_mask.shape}")
+            #print(f"DEBUG: hubert_out shape: {hubert_out.shape}")
+            #print(f"DEBUG: target_length = hubert_out.size(1) * REDUCTION = {hubert_out.size(1)} * {REDUCTION} = {hubert_out.size(1) * REDUCTION}")
+            
             mask_ds = self._downsample_attention_mask(
                 attention_mask, hubert_out.size(1) * REDUCTION
-            )                               # still length 250
-            output_attention_mask = mask_ds[:, ::REDUCTION]    # length 125
-        else:
-            B, Na_r, _ = hubert_out.shape
-            output_attention_mask = torch.ones(
-                B, Na_r, dtype=torch.long, device=hubert_out.device
             )
+            #print(f"DEBUG: mask_ds shape after _downsample_attention_mask: {mask_ds.shape}")
+            
+            output_attention_mask = mask_ds[:, ::REDUCTION]
+            #print(f"DEBUG: Final output_attention_mask shape: {output_attention_mask.shape}")
+        #else:
+        #    B, Na_r, _ = hubert_out.shape
+        #    output_attention_mask = torch.ones(
+        #        B, Na_r, dtype=torch.long, device=hubert_out.device
+        #    )
+        else:
+            raise ValueError("Attention mask is required")
         feats = self.layer_norm(self.projection1(hubert_out))
         feats = self.projection2(feats)
-        feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
+        #feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
         return feats, output_attention_mask
     
     def unfreeze_hubert(self):
-        """Unfreeze HuBERT parameters for fine-tuning after warmup period."""
-        if self.hubert_frozen:
-            print("Unfreezing HuBERT parameters...")
-            for param in self.hubert.parameters():
-                param.requires_grad = True
-            self.hubert_frozen = False
-            print(f"HuBERT parameters unfrozen. Total trainable params: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
-        else:
-            print("HuBERT parameters are already unfrozen")
+        pass
 
 class VisionEncoder(nn.Module):
 
     def __init__(self, embedding_dim=256, patch_dropout_prob=0.1, lora_rank=16, lora_alpha=32):
         super().__init__()
+        quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
 
-        self.model = AutoModel.from_pretrained('facebook/dinov2-with-registers-base')
+        self.model = AutoModel.from_pretrained('facebook/dinov2-with-registers-base', quantization_config=quantization_config, device_map="auto")
         self.model.gradient_checkpointing_enable()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -165,7 +192,7 @@ class VisionEncoder(nn.Module):
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules, 
-            #bias="none",          
+            bias="none",          
             #modules_to_save=None,  
         )
 
@@ -219,7 +246,7 @@ class VisionEncoder(nn.Module):
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         if self.training:
             feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        feats = F.normalize(feats, dim=-1)
+        #feats = F.normalize(feats, dim=-1)
         #print("Dino output shape: ", feats.shape)
         return feats
 
@@ -233,11 +260,9 @@ class VeS(nn.Module):
         super().__init__()
 
         self.visual_embedder = VisionEncoder()  
-        #self.visual_processor = AutoProcessor.from_pretrained("facebook/dinov2-with-registers-base")
-
-        self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960", freeze_hubert_initially=freeze_hubert_initially)
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
-        self.bias = nn.Parameter(torch.tensor(-10.0))
+        self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960")
+        #self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
+        #self.bias = nn.Parameter(torch.tensor(-10.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.tv_weight = 0.0
@@ -250,8 +275,8 @@ class VeS(nn.Module):
         Returns sim: (B, N1, N2)
         """ 
         sim = torch.bmm(feats1, feats2.transpose(1, 2))
-        logit_scale_exp = torch.exp(self.logit_scale.clone())
-        return sim * logit_scale_exp
+        #logit_scale_exp = torch.exp(self.logit_scale.clone())
+        return sim #* self.temperature
 
 
     def compute_all_similarities_tv(self,
@@ -276,27 +301,43 @@ class VeS(nn.Module):
         token_sims : (B, B, Na, Nv)     raw token-level similarities
         """
         B = audio_feats.size(0)
+        Na_audio = audio_feats.size(1)
+        Na_mask = attention_mask.size(1)
+
+        if Na_mask != Na_audio:
+            print(f"Warning: Attention mask length ({Na_mask}) != audio feats length ({Na_audio})")
+            raise ValueError(f"Attention mask and audio features have mismatched sequence lengths: {Na_mask} vs {Na_audio}")
+
         af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
         # token-level sim
         token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
-        logit_scale_exp = torch.exp(self.logit_scale.clone())
-        token_sims = token_sims * logit_scale_exp       # scale by learned temp
+        
+        # Create expanded mask for token_sims
+        a_mask = attention_mask.unsqueeze(1).unsqueeze(3).float().expand(-1, B, -1, vf.size(2))  # (B, B, Na, Nv)
+        
+        # Mask out padded tokens BEFORE max operations
+        masked_token_sims = token_sims.clone()
+        masked_token_sims[a_mask == 0] = float('-inf')  # Set padded positions to -inf
 
-        # 1)  audio → visual • max over patches, mean over tokens
+        # 1) audio → visual • max over patches, mean over tokens
+        a2v_max = masked_token_sims.max(dim=3).values               # (B, B, Na)
+        
+        # Replace -inf with 0 before multiplication to avoid NaN
+        a2v_max = torch.where(torch.isinf(a2v_max), torch.zeros_like(a2v_max), a2v_max)
+        
+        a_mask_2d = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
+        a2v_sum = (a2v_max * a_mask_2d).sum(dim=2)                  # (B, B)
+        valid_a = a_mask_2d.sum(dim=2).clamp(min=1e-5)
+        a2v_clip = a2v_sum / valid_a                                # (B, B)
 
-        a2v_max  = token_sims.max(dim=3).values                      # (B, B, Na)
-        a_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        a2v_sum  = (a2v_max * a_mask).sum(dim=2)                     # (B, B)
-        valid_a  = a_mask.sum(dim=2).clamp(min=1e-5)  # Slightly larger epsilon for bf16
-        a2v_clip = a2v_sum / valid_a                                 # (B, B)
+        # 2) visual → audio • max over tokens, mean over patches  
+        v2a_max = masked_token_sims.max(dim=2).values               # (B, B, Nv)
+        v2a_max = torch.where(torch.isinf(v2a_max), torch.zeros_like(v2a_max), v2a_max)
+        v2a_clip = v2a_max.mean(dim=2)                              # (B, B)
 
-        # 2)  visual → audio • max over tokens, mean over patches
-        v2a_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
-        v2a_clip = v2a_max.mean(dim=2)                               # (B, B)
-
-        clip_sims = 0.5 * (a2v_clip + v2a_clip)                      # (B, B)
+        clip_sims = 0.5 * (a2v_clip + v2a_clip)                     # (B, B)
 
         return clip_sims, token_sims
 
@@ -317,9 +358,9 @@ class VeS(nn.Module):
         l_nonneg = neg_sims.pow(2).mean()
 
         # Early-exit if temporal smoothing is disabled
-        if getattr(self, "tv_weight", 0.0) == 0.0:
-            return l_nonneg
-      
+        #if getattr(self, "tv_weight", 0.0) == 0.0:
+        return l_nonneg
+        '''
         # (2) temporal-variation (TV) smoothing on diagonal
         B = token_sims.size(0)
         device = token_sims.device
@@ -338,11 +379,11 @@ class VeS(nn.Module):
         else:
             l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
 
-        return l_nonneg# + self.tv_weight * l_tv
+        return l_nonneg# + self.tv_weight * l_tv'''
 
 
     
-    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
+    '''def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
         Algorithm 1 Sigmoid loss pseudo-implementation.
@@ -384,6 +425,22 @@ class VeS(nn.Module):
 
         total_loss = pairwise_loss + reg_loss
 
+        return total_loss'''
+
+    def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
+        """Compute InfoNCE loss with regularization"""
+        batch_size = clip_similarities.shape[0]
+        labels = torch.arange(batch_size).to(clip_similarities.device)
+        # Audio to Visual direction
+        log_prob_a2v = F.log_softmax(clip_similarities, dim=1)
+        losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
+        # Visual to Audio direction  
+        log_prob_v2a = F.log_softmax(clip_similarities.t(), dim=1)
+        losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
+        # Average both directions
+        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+        reg_loss = self.compute_regularization_losses_tv(token_sims, attention_mask)    
+        total_loss = contrastive_loss + reg_loss
         return total_loss
     
     def forward(self, audio_input, images, attention_mask=None):
@@ -401,20 +458,20 @@ class VeS(nn.Module):
                 - audio_feats: (B, Na, D) audio features
                 - visual_feats: (B, Nv, D) visual features
         """
-        audio_feats, attention_mask = self.audio_embedder(audio_input, attention_mask)
+        audio_feats, audio_attention_mask = self.audio_embedder(audio_input, attention_mask)
         visual_feats = self.visual_embedder(images)
         clip_sims, token_sims = self.compute_all_similarities_tv(
             audio_feats, 
             visual_feats, 
-            attention_mask
+            audio_attention_mask
         )
-        loss = self.compute_contrastive_loss_tv(clip_sims, token_sims, attention_mask)
+        loss = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
         return {
             'loss': loss,
             'clip_sims': clip_sims.detach(),
             'audio_feats': audio_feats.detach(),
             'visual_feats': visual_feats.detach(),
-            'audio_attention_mask': attention_mask.detach(),
+            'audio_attention_mask': audio_attention_mask.detach(),
             'token_sims': token_sims.detach()
         }
 
@@ -449,8 +506,8 @@ if __name__ == "__main__":
 
     trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params (Stage 1): {trainable_before:,}")
-    
-    outputs = model(audio_input, images)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        outputs = model(audio_input, images)
     print(f"Visual features shape: {outputs['visual_feats'].shape}")
     print(f"Audio features shape: {outputs['audio_feats'].shape}")
     print(f"Clip similarities shape: {outputs['clip_sims'].shape}")
@@ -464,7 +521,8 @@ if __name__ == "__main__":
     
     model.train()
     with torch.no_grad():
-        outputs = model(audio_input, images)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(audio_input, images)
         print(f"Visual features shape: {outputs['visual_feats'].shape}")
         print(f"Audio features shape: {outputs['audio_feats'].shape}")
         print(f"Clip similarities shape: {outputs['clip_sims'].shape}")

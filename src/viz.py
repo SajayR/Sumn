@@ -94,6 +94,7 @@ class VeSVisualizer:
         # --- figure out "valid" token count ------------------------------
         mask_tok  = int(attn_mask.round().sum().item())      # robust, still an int
         sim_tok   = token_sims.size(0)                       # what we actually have
+        #print(f"mask_tok: {mask_tok}, sim_tok: {sim_tok}")
         valid_tok = min(mask_tok, sim_tok)                   # stay in bounds
 
         token_sims = token_sims[:valid_tok]                  # (valid_tok, Nv)
@@ -217,7 +218,7 @@ class VeSVisualizer:
         imgs   = batch["image"].cpu()                       # (B,3,224,224)
         audio  = batch["audio"].cpu().numpy()               # (B,T)
         sr     = batch["sampling_rate"]                     # list[int] or int
-        attn   = batch["audio_attention_mask"].cpu()        # (B,Na)
+        attn   = outputs["audio_attention_mask"].cpu()        # (B,Na)
         sims   = outputs["token_sims"].cpu()                # (B,B,Na,Nv)
 
         # Convert sr to per-sample list
