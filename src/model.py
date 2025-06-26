@@ -19,6 +19,7 @@ from peft import (
     TaskType,
 )
 import torch._dynamo
+import numpy as np
 from peft import prepare_model_for_kbit_training
 import os 
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
@@ -141,7 +142,7 @@ class AudioEmbedder(nn.Module):
             raise ValueError("Attention mask is required")
         feats = self.layer_norm(self.projection1(hubert_out))
         feats = self.projection2(feats)
-        #feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
+        feats = F.normalize(feats, dim=-1)                     # (B, Na//2, D)
         return feats, output_attention_mask
     
     def unfreeze_hubert(self):
@@ -235,7 +236,7 @@ class VisionEncoder(nn.Module):
         feats = self.projection2(normed)
         #if self.training:
             #feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        #feats = F.normalize(feats, dim=-1)
+        feats = F.normalize(feats, dim=-1)
         #print("Dino output shape: ", feats.shape)
         return feats
 
@@ -252,6 +253,8 @@ class VeS(nn.Module):
         self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960")
         #self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
         #self.bias = nn.Parameter(torch.tensor(-10.0))
+
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.tv_weight = 0.45
@@ -265,7 +268,7 @@ class VeS(nn.Module):
         """ 
         sim = torch.bmm(feats1, feats2.transpose(1, 2))
         #logit_scale_exp = torch.exp(self.logit_scale.clone())
-        return sim #* self.temperature
+        return sim * self.logit_scale
 
 
     def compute_all_similarities_tv(self,
@@ -306,7 +309,7 @@ class VeS(nn.Module):
         token_sims = torch.einsum(
             'bnd, mvd -> bmnv',            # (B,Na,D) × (B,Nv,D)
             audio_feats, visual_feats
-        )
+        ) 
 
         
         # Create expanded mask for token_sims
@@ -380,8 +383,8 @@ class VeS(nn.Module):
         return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
 
 
-    
-    '''def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
+    '''
+    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
         Algorithm 1 Sigmoid loss pseudo-implementation.
@@ -419,15 +422,19 @@ class VeS(nn.Module):
         #pairwise_loss = pairwise_loss * 10
 
         # optional regularisation (unchanged from the original implementation)
-        reg_loss   = self.compute_regularization_losses_tv(token_sims, attention_mask)
+        reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)
 
         total_loss = pairwise_loss + reg_loss
 
-        return total_loss'''
-
+        return total_loss, l_nonneg, l_tv
+    '''
+    
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
         """Compute InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
+        scale = self.logit_scale.exp().clamp(max=100)
+        clip_similarities = scale * clip_similarities
+        
         labels = torch.arange(batch_size).to(clip_similarities.device)
         # Audio to Visual direction
         log_prob_a2v = F.log_softmax(clip_similarities, dim=1)
@@ -440,6 +447,7 @@ class VeS(nn.Module):
         reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)    
         total_loss = contrastive_loss + reg_loss
         return total_loss, l_nonneg, l_tv
+    
         
     
     def forward(self, audio_input, images, attention_mask=None):

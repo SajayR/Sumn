@@ -491,8 +491,8 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
-            "project": "VeS-infonce-love",
+            "enabled": True,
+            "project": "VeS-love",
             "name": "temploss-0.45",
             "log_freq": 1, 
             "watch_model": False,  
