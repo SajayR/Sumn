@@ -399,7 +399,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 #   periodic visualisation
                 # ---------------------------------------------------------
-                if self.global_step % self.viz_every_steps == 0:# and self.global_step != 0:
+                if self.global_step % self.viz_every_steps == 0 and self.global_step != 0:
                     matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
@@ -429,6 +429,7 @@ class VeSTrainer:
                         "train/step": self.global_step,
                         "train/l_nonneg": outputs["l_nonneg"].item(),
                         "train/l_tv": outputs["l_tv"].item(),
+                        "train/logit_scale": self.model.logit_scale.exp().item(),
                         #"bias": self.model.bias.item(),
                         #"logit_scale": self.model.logit_scale.item(),
                     }, step=self.global_step)
@@ -493,7 +494,7 @@ if __name__ == "__main__":
         "wandb": {
             "enabled": True,
             "project": "VeS-love",
-            "name": "temploss-0.45",
+            "name": "temploss-10.0",
             "log_freq": 1, 
             "watch_model": False,  
         },

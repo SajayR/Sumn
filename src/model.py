@@ -257,7 +257,7 @@ class VeS(nn.Module):
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.tv_weight = 0.45
+        self.tv_weight = 10.0
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
