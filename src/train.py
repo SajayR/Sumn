@@ -25,11 +25,13 @@ import bitsandbytes as bnb
 from viz import VeSVisualizer
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
-torch.cuda.set_per_process_memory_fraction(0.95) 
+torch.cuda.set_per_process_memory_fraction(0.98) 
+torch.compiler.reset()  
 #torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 import os 
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
+os.environ["TORCH_COMPILE_DEBUG"] = "1"
 
 class VeSTrainer:
     """Simple trainer for the VeS model with the VAANI paired dataset."""
@@ -425,6 +427,8 @@ class VeSTrainer:
                         "train/learning_rate": current_lr,
                         "train/epoch": epoch,
                         "train/step": self.global_step,
+                        "train/l_nonneg": outputs["l_nonneg"].item(),
+                        "train/l_tv": outputs["l_tv"].item(),
                         #"bias": self.model.bias.item(),
                         #"logit_scale": self.model.logit_scale.item(),
                     }, step=self.global_step)
@@ -463,7 +467,7 @@ if __name__ == "__main__":
             "use_amp": True,
             
             # Data settings
-            "batch_size": 54,
+            "batch_size": 60,
             "num_workers": 12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
@@ -487,9 +491,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
-            "project": "VeS-infonce",
-            "name": "WtfMode",
+            "enabled": False,
+            "project": "VeS-infonce-love",
+            "name": "temploss-0.45",
             "log_freq": 1, 
             "watch_model": False,  
         },

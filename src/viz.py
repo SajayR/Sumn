@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.colors as mcolors
 
 
 class VeSVisualizer:
@@ -26,7 +27,7 @@ class VeSVisualizer:
         self,
         out_dir: str | Path = "visualizations",
         token_hz: int = 25,                 # 1 / (0.02s * 2) = 25 Hz
-        alpha: float = 0.25,                # heat-map opacity
+        alpha: float = 0.9,                # heat-map opacity
         max_samples_per_call: int = 4,
         reduction: int = 2,
     ):
@@ -42,10 +43,22 @@ class VeSVisualizer:
         # ImageNet mean / std for un-normalising
         self._mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self._std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        
+        # Create inferno colormap with alpha
+        self._inferno_cmap = self._get_inferno_with_alpha()
 
     # ---------------------------------------------------------------------
     #                         internal helpers
     # ---------------------------------------------------------------------
+
+    def _get_inferno_with_alpha(self):
+        """Create inferno colormap with alpha channel that varies from transparent to opaque."""
+        inferno = plt.cm.inferno(np.linspace(0, 1, 256))
+        alphas = np.linspace(0, 1, 256)
+        inferno_with_alpha = np.zeros((256, 4))
+        inferno_with_alpha[:, 0:3] = inferno[:, 0:3]
+        inferno_with_alpha[:, 3] = alphas
+        return mcolors.ListedColormap(inferno_with_alpha)
 
     def _unnormalise(self, img_t: torch.Tensor) -> np.ndarray:
         """(3,224,224) float-tensor → uint8 RGB H×W×C."""
@@ -59,18 +72,129 @@ class VeSVisualizer:
         grid: int = 16,
         size: int = 224,
     ) -> np.ndarray:
-        """One token's patch-similarity vector → coloured uint8 RGB heat-map."""
+        """One token's patch-similarity vector → RGBA heat-map with inferno colormap."""
         #print(sim_row.shape)
         assert sim_row.shape == torch.Size([256]), f"Expected sim_row shape [256], got {sim_row.shape}"
         arr = sim_row.view(grid, grid).float().cpu()
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-6)
-        arr = (arr * 255).byte().numpy()
-        arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_CUBIC)
-        heat = cv2.applyColorMap(arr, cv2.COLORMAP_JET)          # BGR
-        return cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)             # → RGB
+        
+        # Normalize similarity values
+        arr = arr.clamp_min(0)
+        arr = arr - arr.min()
+        arr = arr / (arr.max() + 1e-6)
+        
+        # Resize to target size
+        arr_resized = cv2.resize(arr.numpy(), (size, size), interpolation=cv2.INTER_CUBIC)
+        
+        # Apply inferno colormap with alpha - this creates RGBA values
+        heat_rgba = self._inferno_cmap(arr_resized)  # Shape: (size, size, 4)
+        
+        # Convert to uint8
+        heat_rgba = (heat_rgba * 255).astype(np.uint8)
+        
+        return heat_rgba
 
-    def _blend(self, rgb: np.ndarray, heat: np.ndarray) -> np.ndarray:
-        return cv2.addWeighted(rgb, 1.0 - self.alpha, heat, self.alpha, 0)
+    def _blend(self, rgb: np.ndarray, heat_rgba: np.ndarray) -> np.ndarray:
+        """Blend RGB image with RGBA heatmap using proper alpha compositing."""
+        # Extract RGB and alpha from heatmap
+        heat_rgb = heat_rgba[:, :, :3].astype(np.float32) / 255.0
+        heat_alpha = heat_rgba[:, :, 3:4].astype(np.float32) / 255.0
+        
+        # Convert base image to float
+        rgb_base = rgb.astype(np.float32) / 255.0
+        
+        # Alpha blend: result = heat * alpha + base * (1 - alpha)
+        alpha_3ch = np.repeat(heat_alpha, 3, axis=2)
+        result = heat_rgb * alpha_3ch + rgb_base * (1 - alpha_3ch)
+        
+        # Convert back to uint8
+        return (result * 255).astype(np.uint8)
+
+    def _calculate_crop_region(self, crop_info: dict | None, video_size: int = 448, sample_idx: int = 0) -> tuple[int, int, int, int]:
+        """
+        Calculate the crop region to remove black padding from pad_square strategy.
+        
+        Args:
+            crop_info: Dictionary with original_width, original_height, crop_strategy, target_size
+            video_size: Current video frame size (448x448)
+            
+        Returns:
+            tuple: (x1, y1, x2, y2) crop coordinates
+        """
+        if crop_info is None:
+            # No cropping needed when no crop_info
+            return (0, 0, video_size, video_size)
+            
+        # Handle crop_strategy which might be a batched tensor
+        crop_strategy = crop_info["crop_strategy"]
+        
+        # Handle batched tensors by extracting the value for this sample
+        if hasattr(crop_strategy, '__getitem__') and hasattr(crop_strategy, 'shape') and len(crop_strategy.shape) > 0:
+            crop_strategy = crop_strategy[sample_idx]
+        
+        # Convert to scalar/string if it's a tensor
+        if hasattr(crop_strategy, 'item'):
+            crop_strategy = crop_strategy.item()
+        elif isinstance(crop_strategy, bytes):
+            crop_strategy = crop_strategy.decode('utf-8')
+            
+        if crop_strategy != "pad_square":
+            # No cropping needed for other strategies
+            return (0, 0, video_size, video_size)
+        
+        # Extract values for this specific sample from potentially batched tensors
+        orig_w = crop_info["original_width"]
+        orig_h = crop_info["original_height"]
+        target_size = crop_info["target_size"]  # Usually 224
+        
+        # Handle batched tensors by extracting the value for this sample
+        if hasattr(orig_w, '__getitem__') and hasattr(orig_w, 'shape') and len(orig_w.shape) > 0:
+            orig_w = orig_w[sample_idx]
+        if hasattr(orig_h, '__getitem__') and hasattr(orig_h, 'shape') and len(orig_h.shape) > 0:
+            orig_h = orig_h[sample_idx]
+        if hasattr(target_size, '__getitem__') and hasattr(target_size, 'shape') and len(target_size.shape) > 0:
+            target_size = target_size[sample_idx]
+            
+        # Convert to scalars if they're still tensors
+        if hasattr(orig_w, 'item'):
+            orig_w = orig_w.item()
+        if hasattr(orig_h, 'item'):
+            orig_h = orig_h.item()
+        if hasattr(target_size, 'item'):
+            target_size = target_size.item()
+        
+        # Calculate what happened during pad_square processing:
+        # 1. Original image was padded to max(orig_w, orig_h) square
+        # 2. Then resized to target_size (224)
+        # 3. Now it's been resized again to video_size (448)
+        
+        max_dim = max(orig_w, orig_h)
+        
+        # Calculate the relative size of actual content in the square
+        content_w_ratio = orig_w / max_dim
+        content_h_ratio = orig_h / max_dim
+        
+        # Scale to current video size
+        content_w_pixels = int(content_w_ratio * video_size)
+        content_h_pixels = int(content_h_ratio * video_size)
+        
+        # Ensure dimensions are divisible by 2 for video encoding
+        if content_w_pixels % 2 != 0:
+            content_w_pixels -= 1
+        if content_h_pixels % 2 != 0:
+            content_h_pixels -= 1
+        
+        # Calculate crop coordinates (centered)
+        x1 = (video_size - content_w_pixels) // 2
+        y1 = (video_size - content_h_pixels) // 2
+        x2 = x1 + content_w_pixels
+        y2 = y1 + content_h_pixels
+        
+        return (x1, y1, x2, y2)
+
+    def _apply_crop(self, frame: np.ndarray, crop_coords: tuple[int, int, int, int]) -> np.ndarray:
+        """Apply cropping to a frame and return the cropped region."""
+        x1, y1, x2, y2 = crop_coords
+        return frame[y1:y2, x1:x2]
 
     # ---------------------------------------------------------------------
     #                       encode ONE sample to MP4
@@ -84,12 +208,20 @@ class VeSVisualizer:
         sr: int,
         basename: str,
         attn_mask: torch.Tensor,            # (Na,) float  cpu
+        crop_info: dict | None = None,      # New parameter for crop information
+        sample_idx: int = 0,                # New parameter for sample index in batch
     ):
         # --- prepare video base frame ------------------------------------
         rgb_base = self._unnormalise(image_t)               # uint8 H×W×3 (224×224)
         # Double the size of the video
         rgb_base = cv2.resize(rgb_base, (448, 448), interpolation=cv2.INTER_CUBIC)
-        H, W, _ = rgb_base.shape
+        
+        # Calculate crop region to remove black padding
+        crop_coords = self._calculate_crop_region(crop_info, video_size=448, sample_idx=sample_idx)
+        
+        # Apply initial crop to base frame to determine final video dimensions
+        rgb_base_cropped = self._apply_crop(rgb_base, crop_coords)
+        H, W, _ = rgb_base_cropped.shape
 
         # --- figure out "valid" token count ------------------------------
         mask_tok  = int(attn_mask.round().sum().item())      # robust, still an int
@@ -122,15 +254,18 @@ class VeSVisualizer:
 
         # --- write video frames ------------------------------------------
         for t in range(valid_tok):
-            heat = self._sim_to_heatmap(token_sims[t], size=448)  # Match doubled video size
-            frame_np = self._blend(rgb_base, heat)
+            heat_rgba = self._sim_to_heatmap(token_sims[t], size=448)  # Match doubled video size
+            frame_np = self._blend(rgb_base, heat_rgba)
+            
+            # Apply cropping to remove black padding
+            frame_np_cropped = self._apply_crop(frame_np, crop_coords)
 
             # 🌱 timestamp overlay (bottom-left)
             ts_sec = t / self.fps
             cv2.putText(
-                frame_np,
+                frame_np_cropped,
                 f"{ts_sec:5.2f}s",
-                (10, H - 10),
+                (10, frame_np_cropped.shape[0] - 10),  # Adjust for new height
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
                 (255, 255, 255),
@@ -140,10 +275,10 @@ class VeSVisualizer:
 
             # Collect frames for matplotlib
             if t in frame_indices:
-                collected_frames.append(frame_np.copy())
+                collected_frames.append(frame_np_cropped.copy())
                 collected_timestamps.append(ts_sec)
 
-            frame = av.VideoFrame.from_ndarray(frame_np, format="rgb24")
+            frame = av.VideoFrame.from_ndarray(frame_np_cropped, format="rgb24")
             for pkt in vstream.encode(frame):
                 container.mux(pkt)
 
@@ -220,6 +355,30 @@ class VeSVisualizer:
         sr     = batch["sampling_rate"]                     # list[int] or int
         attn   = outputs["audio_attention_mask"].cpu()        # (B,Na)
         sims   = outputs["token_sims"].cpu()                # (B,B,Na,Nv)
+        # Handle crop_info - handle various possible structures from DataLoader
+        crop_infos = []
+        if "crop_info" in batch:
+            raw_crop_infos = batch["crop_info"]
+            
+            # Handle different possible structures
+            if isinstance(raw_crop_infos, list):
+                # Expected case: list of crop_info dicts
+                crop_infos = raw_crop_infos
+            elif isinstance(raw_crop_infos, dict):
+                # If DataLoader somehow batched the dict fields
+                # Extract each sample's crop_info
+                batch_size = imgs.size(0)
+                for i in range(batch_size):
+                    try:
+                        sample_crop_info = {k: v[i] if isinstance(v, (list, tuple)) else v for k, v in raw_crop_infos.items()}
+                        crop_infos.append(sample_crop_info)
+                    except (IndexError, KeyError):
+                        crop_infos.append(None)
+            else:
+                # Fallback: fill with None
+                crop_infos = [None] * imgs.size(0)
+        else:
+            crop_infos = [None] * imgs.size(0)
 
         # Convert sr to per-sample list
         if isinstance(sr, int):
@@ -239,6 +398,8 @@ class VeSVisualizer:
                 sr=sr[i],
                 basename=basename,
                 attn_mask=attn[i],
+                crop_info=crop_infos[i] if isinstance(crop_infos, list) else crop_infos,
+                sample_idx=i,
             )
             
             # Create matplotlib figure
@@ -248,3 +409,98 @@ class VeSVisualizer:
                     matplotlib_figures.append((basename, fig))
         
         return matplotlib_figures
+
+
+if __name__ == "__main__":
+    import requests
+    from PIL import Image
+    import argparse
+    
+    def test_heatmap_visualization():
+        """Test the heatmap visualization with a sample image."""
+        parser = argparse.ArgumentParser(description="Test heatmap visualization")
+        parser.add_argument("--image", type=str, 
+                          default="https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=400",
+                          help="Image URL or local path")
+        parser.add_argument("--output", type=str, default="test_viz", 
+                          help="Output directory")
+        args = parser.parse_args()
+        
+        # Create visualizer
+        viz = VeSVisualizer(out_dir=args.output, alpha=0.4)
+        
+        # Load image
+        if args.image.startswith("http"):
+            response = requests.get(args.image)
+            img = Image.open(requests.get(args.image, stream=True).raw)
+        else:
+            img = Image.open(args.image)
+        
+        # Convert to tensor format (224x224, normalized)
+        img = img.convert("RGB").resize((224, 224))
+        img_array = np.array(img) / 255.0
+        
+        # Apply ImageNet normalization
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img_norm = (img_array - mean) / std
+        img_tensor = torch.tensor(img_norm).permute(2, 0, 1).float()
+        
+        # Generate fake similarity data with some interesting patterns
+        n_tokens = 50  # ~2 seconds at 25 Hz
+        sim_data = torch.zeros(n_tokens, 256)
+        
+        for t in range(n_tokens):
+            # Create some moving hotspots and patterns
+            peak1_x = int(8 + 6 * np.sin(t * 0.3))  # Moving horizontally
+            peak1_y = int(8 + 4 * np.cos(t * 0.2))  # Moving vertically
+            peak2_x = int(12 + 3 * np.sin(t * 0.4 + 1))
+            peak2_y = int(6 + 3 * np.cos(t * 0.3 + 1))
+            
+            # Base random similarity
+            sim_grid = torch.randn(16, 16) * 0.1 + 0.3
+            
+            # Add peaks
+            sim_grid[peak1_y, peak1_x] = 0.9 + 0.1 * np.sin(t * 0.5)
+            sim_grid[peak2_y, peak2_x] = 0.8 + 0.1 * np.cos(t * 0.4)
+            
+            # Add some spreading around peaks
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]:
+                    if 0 <= peak1_y + dy < 16 and 0 <= peak1_x + dx < 16:
+                        sim_grid[peak1_y + dy, peak1_x + dx] += 0.3 * np.exp(-(dx**2 + dy**2) * 0.5)
+            
+            sim_data[t] = sim_grid.flatten()
+        
+        # Generate fake audio (silence)
+        audio_samples = n_tokens * viz.samples_per_token
+        audio = np.zeros(audio_samples, dtype=np.float32)
+        
+        # Create attention mask (all valid)
+        attn_mask = torch.ones(n_tokens)
+        
+        # Generate the visualization
+        print(f"Generating test visualization with {n_tokens} frames...")
+        frames, timestamps = viz._encode_sample(
+            image_t=img_tensor,
+            token_sims=sim_data,
+            audio_np=audio,
+            sr=16000,
+            basename="test_heatmap",
+            attn_mask=attn_mask,
+            crop_info=None,
+        )
+        
+        # Create matplotlib figure
+        if frames:
+            fig = viz._create_frame_plot(frames, timestamps, "test_heatmap")
+            if fig is not None:
+                print(f"✅ Test visualization saved to {args.output}/")
+                print(f"   Video: test_heatmap.mp4")
+                print(f"   Frames: test_heatmap_frames.png")
+            else:
+                print("❌ Failed to create matplotlib figure")
+        else:
+            print("❌ No frames collected")
+    
+    test_heatmap_visualization()

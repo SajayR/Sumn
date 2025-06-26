@@ -90,24 +90,10 @@ class AudioEmbedder(nn.Module):
         if attention_mask is None:
             return None
         
-        batch_size = attention_mask.size(0)
-        input_length = attention_mask.size(1)
-        
-        # DEBUG: Add these prints
-        #print(f"DEBUG: input_length={input_length}, downsample_factor={self.downsample_factor}, target_length={target_length}")
-        #print(f"DEBUG: input_length // downsample_factor = {input_length // self.downsample_factor}")
-        
-        # Method 1: Simple downsampling by taking every nth element
-        if input_length // self.downsample_factor == target_length:
-            #print("DEBUG: Using Method 1 (stride-based)")
-            downsampled_mask = attention_mask[:, ::self.downsample_factor][:, :target_length]
-            #print(f"DEBUG: After stride downsampling: {downsampled_mask.shape}")
-        else:
-            #print("DEBUG: Using Method 2 (adaptive pooling)")
-            mask_float = attention_mask.float().unsqueeze(1)
-            downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)
-            downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()
-            #print(f"DEBUG: After adaptive pooling: {downsampled_mask.shape}")
+        # Always use adaptive pooling - works for all cases
+        mask_float = attention_mask.float().unsqueeze(1)  # (B, 1, input_length)
+        downsampled_mask = F.adaptive_avg_pool1d(mask_float, target_length)  # (B, 1, target_length)
+        downsampled_mask = (downsampled_mask.squeeze(1) > 0.5).long()  # (B, target_length)
         
         return downsampled_mask
     
@@ -197,7 +183,7 @@ class VisionEncoder(nn.Module):
         )
 
         self.model = get_peft_model(self.model, lora_config)
-
+    
         self.projection1 = nn.Linear(self.model.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
@@ -243,7 +229,10 @@ class VisionEncoder(nn.Module):
         #print("Dino input shape: ", x.shape)
         outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
         patches = outputs.last_hidden_state[:,1:, :] #5 cause 1 is the cls token, 4 are registers
-        feats = self.projection2(self.layer_norm(self.projection1(patches)))
+        #feats = self.projection2(self.layer_norm(self.projection1(patches)))
+        proj1 = self.projection1(patches)
+        normed = self.layer_norm(proj1)
+        feats = self.projection2(normed)
         #if self.training:
             #feats = self.patch_dropout(feats, self.patch_dropout_rate)
         #feats = F.normalize(feats, dim=-1)
@@ -265,7 +254,7 @@ class VeS(nn.Module):
         #self.bias = nn.Parameter(torch.tensor(-10.0))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.tv_weight = 0.0
+        self.tv_weight = 0.45
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -308,14 +297,23 @@ class VeS(nn.Module):
             print(f"Warning: Attention mask length ({Na_mask}) != audio feats length ({Na_audio})")
             raise ValueError(f"Attention mask and audio features have mismatched sequence lengths: {Na_mask} vs {Na_audio}")
 
-        af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
+        #af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
+        #vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
         # token-level sim
-        token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
+        #token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
+
+        token_sims = torch.einsum(
+            'bnd, mvd -> bmnv',            # (B,Na,D) × (B,Nv,D)
+            audio_feats, visual_feats
+        )
+
         
         # Create expanded mask for token_sims
-        a_mask = attention_mask.unsqueeze(1).unsqueeze(3).float().expand(-1, B, -1, vf.size(2))  # (B, B, Na, Nv)
+        #a_mask = attention_mask.unsqueeze(1).unsqueeze(3).float().expand(-1, B, -1, vf.size(2))  # (B, B, Na, Nv)
+
+        Nv = visual_feats.size(1)
+        a_mask = attention_mask[:, None, :, None].expand(-1, B, -1, Nv)
         
         # Mask out padded tokens BEFORE max operations
         masked_token_sims = token_sims.clone()
@@ -358,9 +356,9 @@ class VeS(nn.Module):
         l_nonneg = neg_sims.pow(2).mean()
 
         # Early-exit if temporal smoothing is disabled
-        #if getattr(self, "tv_weight", 0.0) == 0.0:
-        return l_nonneg
-        '''
+        if getattr(self, "tv_weight", 0.0) == 0.0:
+            return l_nonneg
+        
         # (2) temporal-variation (TV) smoothing on diagonal
         B = token_sims.size(0)
         device = token_sims.device
@@ -379,7 +377,7 @@ class VeS(nn.Module):
         else:
             l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
 
-        return l_nonneg# + self.tv_weight * l_tv'''
+        return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
 
 
     
@@ -439,9 +437,10 @@ class VeS(nn.Module):
         losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
         # Average both directions
         contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
-        reg_loss = self.compute_regularization_losses_tv(token_sims, attention_mask)    
+        reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)    
         total_loss = contrastive_loss + reg_loss
-        return total_loss
+        return total_loss, l_nonneg, l_tv
+        
     
     def forward(self, audio_input, images, attention_mask=None):
         """
@@ -465,14 +464,16 @@ class VeS(nn.Module):
             visual_feats, 
             audio_attention_mask
         )
-        loss = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
+        loss, l_nonneg, l_tv = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
         return {
             'loss': loss,
             'clip_sims': clip_sims.detach(),
             'audio_feats': audio_feats.detach(),
             'visual_feats': visual_feats.detach(),
             'audio_attention_mask': audio_attention_mask.detach(),
-            'token_sims': token_sims.detach()
+            'token_sims': token_sims.detach(),
+            'l_nonneg': l_nonneg.detach(),
+            'l_tv': l_tv.detach()
         }
 
     def unfreeze_hubert(self):

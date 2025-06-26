@@ -25,9 +25,10 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
         target_size: Target size (224 for ViT)
     
     Returns:
-        torch.Tensor: Normalized image tensor [3, 224, 224]
+        tuple: (torch.Tensor, dict) - Normalized image tensor [3, 224, 224] and original dimensions info
     """
     image = PILImage.open(image_path).convert('RGB')
+    original_width, original_height = image.size
     
     if crop_strategy == "stretch":
         # stretch to target size
@@ -61,7 +62,7 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
         # Pad to square with black, then resize
         width, height = image.size
         max_dim = max(width, height)
-        new_image = PILImage.new('RGB', (max_dim, max_dim), (0, 0, 0))
+        new_image = PILImage.new('RGB', (max_dim, max_dim), color=(0, 0, 0))
         paste_x = (max_dim - width) // 2
         paste_y = (max_dim - height) // 2
         new_image.paste(image, (paste_x, paste_y))        
@@ -91,7 +92,15 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
         )
     ])
     
-    return transform(image)
+    # Create crop info for later use
+    crop_info = {
+        "original_width": original_width,
+        "original_height": original_height,
+        "crop_strategy": crop_strategy,
+        "target_size": target_size
+    }
+    
+    return transform(image), crop_info
 
 
 # Change from IterableDataset to Dataset
@@ -213,7 +222,7 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
             audio_tensor = processed.input_values.squeeze(0)
             attention_mask = processed.attention_mask.squeeze(0)
             
-            image_tensor = process_image(image_path, self.crop_strategy, self.target_size)
+            image_tensor, crop_info = process_image(image_path, self.crop_strategy, self.target_size)
             
             return {
                 "audio": audio_tensor,
@@ -222,6 +231,7 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
                 "image": image_tensor,
                 "audio_path": audio_path,
                 "image_path": image_path,
+                "crop_info": crop_info
             }
             
         except Exception as e:
