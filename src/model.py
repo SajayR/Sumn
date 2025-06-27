@@ -29,25 +29,18 @@ class AudioEmbedder(nn.Module):
 
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
         super().__init__()
-        #self.hubert = HubertModel.from_pretrained(hubert_name)
-        quant_cfg = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_quant_type="nf4",
-            #bnb_4bit_use_double_quant=True,
-        )
+
 
         self.hubert = AutoModel.from_pretrained(
             hubert_name,
-            #quantization_config=quant_cfg,
             device_map="auto",
             torch_dtype=torch.bfloat16
         )
        
       
         lora_cfg = LoraConfig(
-            r=64,
-            lora_alpha=64,
+            r=128,
+            lora_alpha=128,
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
             bias="none",
         )
@@ -140,17 +133,11 @@ class AudioEmbedder(nn.Module):
     
     def unfreeze_hubert(self):
         pass
-
+'''
 class VisionEncoder(nn.Module):
 
-    def __init__(self, embedding_dim=256, patch_dropout_prob=0.1, lora_rank=16, lora_alpha=32):
+    def __init__(self, embedding_dim=256, patch_dropout_prob=0.1, freeze_dino=False):
         super().__init__()
-        quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-                #bnb_4bit_use_double_quant=True,
-            )
 
         self.model = AutoModel.from_pretrained('facebook/dinov2-base', device_map="auto", torch_dtype=torch.bfloat16)#, quantization_config=quantization_config)
         self.model.gradient_checkpointing_enable()
@@ -235,6 +222,43 @@ class VisionEncoder(nn.Module):
         feats = F.normalize(feats, dim=-1)
         #print("Dino output shape: ", feats.shape)
         return feats
+'''
+
+class VisionEncoder(nn.Module):
+    def __init__(self, embedding_dim=256):
+        super().__init__()
+        self.model = AutoModel.from_pretrained('facebook/dinov2-base')
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        hidden_size = self.model.config.hidden_size  
+        
+        self.adapter = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=hidden_size,
+                nhead=12,
+                dim_feedforward=hidden_size * 4,
+                batch_first=True
+            ),
+            num_layers=2
+        )
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_size, 256),
+            nn.LayerNorm(256),
+            nn.Linear(256, embedding_dim)
+        )
+        
+    def forward(self, x):
+        with torch.no_grad():
+            features = self.model(x).last_hidden_state  # [B, N+1, 768]
+
+        adapted = self.adapter(features)  # Still [B, N+1, 768]
+        cls_token = adapted[:, 0]  # [B, 768]
+        patches = adapted[:, 1:]    # [B, N, 768]
+        patch_embeds = self.projection(patches)  # [B, N, 256]
+        patch_embeds = F.normalize(patch_embeds, dim=-1)
+        
+        return patch_embeds 
 
 
 

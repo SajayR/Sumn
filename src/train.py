@@ -492,9 +492,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
-            "project": "VeS-love",
-            "name": "temploss-1.0-scaleinv-fullhubert-infonce",
+            "enabled": True,
+            "project": "VS-Rewamp",
+            "name": "frozendino-0.1",
             "log_freq": 1, 
             "watch_model": False,  
         },
