@@ -50,7 +50,7 @@ class AudioEmbedder(nn.Module):
             bias="none",
         )
 
-        self.hubert = get_peft_model(self.hubert, lora_cfg)
+        #self.hubert = get_peft_model(self.hubert, lora_cfg)
 
         #self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
         self.hubert.gradient_checkpointing_enable()
@@ -122,17 +122,12 @@ class AudioEmbedder(nn.Module):
         hubert_out = hubert_out.transpose(1, 2)                # (B, Na//2, H)
 
         if attention_mask is not None:
-            #print(f"DEBUG: Original attention_mask shape: {attention_mask.shape}")
-            #print(f"DEBUG: hubert_out shape: {hubert_out.shape}")
-            #print(f"DEBUG: target_length = hubert_out.size(1) * REDUCTION = {hubert_out.size(1)} * {REDUCTION} = {hubert_out.size(1) * REDUCTION}")
-            
+
             mask_ds = self._downsample_attention_mask(
                 attention_mask, hubert_out.size(1) * REDUCTION
             )
-            #print(f"DEBUG: mask_ds shape after _downsample_attention_mask: {mask_ds.shape}")
-            
             output_attention_mask = mask_ds[:, ::REDUCTION]
-            #print(f"DEBUG: Final output_attention_mask shape: {output_attention_mask.shape}")
+            
         #else:
         #    B, Na_r, _ = hubert_out.shape
         #    output_attention_mask = torch.ones(
@@ -257,7 +252,7 @@ class VeS(nn.Module):
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.tv_weight = 10.0
+        self.tv_weight = 0.1
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -268,7 +263,8 @@ class VeS(nn.Module):
         """ 
         sim = torch.bmm(feats1, feats2.transpose(1, 2))
         #logit_scale_exp = torch.exp(self.logit_scale.clone())
-        return sim * self.logit_scale
+        sim = sim * self.logit_scale.exp().clamp(max=100)
+        return sim
 
 
     def compute_all_similarities_tv(self,
@@ -339,6 +335,7 @@ class VeS(nn.Module):
         v2a_clip = v2a_max.mean(dim=2)                              # (B, B)
 
         clip_sims = 0.5 * (a2v_clip + v2a_clip)                     # (B, B)
+        clip_sims = clip_sims * self.logit_scale.exp().clamp(max=100)
 
         return clip_sims, token_sims
 
@@ -351,7 +348,7 @@ class VeS(nn.Module):
         Regularisation =  l_nonneg  +  tv_weight * l_tv
 
         • l_nonneg  — pushes all (audio-tok, visual-patch) similarities ≥ 0  
-        • l_tv      — total-variation smoothing on the *positive* pair
+        • l_tv      — scale-invariant total-variation smoothing on the *positive* pair
                     (diagonal b → b) along the audio-token axis
         """
         # (1) non-negativity pressure 
@@ -362,7 +359,7 @@ class VeS(nn.Module):
         if getattr(self, "tv_weight", 0.0) == 0.0:
             return l_nonneg
         
-        # (2) temporal-variation (TV) smoothing on diagonal
+        # (2) scale-invariant temporal-variation (TV) smoothing on diagonal
         B = token_sims.size(0)
         device = token_sims.device
 
@@ -375,16 +372,33 @@ class VeS(nn.Module):
             m_valid   = attn_mask.float().to(device)        # (B, Na)
             neighbour = m_valid[:, 1:] * m_valid[:, :-1]    # (B, Na-1)
 
-            diffs = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2)
-            l_tv  = (diffs * neighbour).sum() / neighbour.sum().clamp_min(1.0)
+            # Scale-invariant TV: normalize differences by local magnitude
+            eps = 1e-6
+            # Use maximum of adjacent values as denominator for stability
+            denominators = torch.maximum(
+                pos_trace[:, :-1].abs(), 
+                pos_trace[:, 1:].abs()
+            ) + eps                                         # (B, Na-1)
+            
+            # Relative differences instead of absolute
+            relative_diffs = ((pos_trace[:, 1:] - pos_trace[:, :-1]) / denominators).pow(2)
+            l_tv  = (relative_diffs * neighbour).sum() / neighbour.sum().clamp_min(1.0)
         else:
-            l_tv = (pos_trace[:, 1:] - pos_trace[:, :-1]).pow(2).mean()
+            # Fallback without attention mask
+            eps = 1e-6
+            denominators = torch.maximum(
+                pos_trace[:, :-1].abs(), 
+                pos_trace[:, 1:].abs()
+            ) + eps                                         # (B, Na-1)
+            
+            relative_diffs = ((pos_trace[:, 1:] - pos_trace[:, :-1]) / denominators).pow(2)
+            l_tv = relative_diffs.mean()
 
         return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
 
 
     '''
-    def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
+    def compute_contrastive_loss(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
         Algorithm 1 Sigmoid loss pseudo-implementation.
@@ -413,7 +427,6 @@ class VeS(nn.Module):
         similarity_stats  : dict of useful monitoring statistics
         """
         B = clip_sims.size(0)
-
         labels = torch.eye(B, device=clip_sims.device) * 2 - 1  # +1 on diag,  elsewhere
         logits        = clip_sims + self.bias      # broadcast learnable bias b
         pairwise_loss = -F.logsigmoid(labels * logits).mean()
@@ -427,13 +440,12 @@ class VeS(nn.Module):
         total_loss = pairwise_loss + reg_loss
 
         return total_loss, l_nonneg, l_tv
-    '''
     
+    '''
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
         """Compute InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
-        scale = self.logit_scale.exp().clamp(max=100)
-        clip_similarities = scale * clip_similarities
+        
         
         labels = torch.arange(batch_size).to(clip_similarities.device)
         # Audio to Visual direction
@@ -472,6 +484,7 @@ class VeS(nn.Module):
             visual_feats, 
             audio_attention_mask
         )
+
         loss, l_nonneg, l_tv = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
         return {
             'loss': loss,

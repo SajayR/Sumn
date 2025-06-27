@@ -468,16 +468,16 @@ if __name__ == "__main__":
             "use_amp": True,
             
             # Data settings
-            "batch_size": 60,
+            "batch_size": 54,
             "num_workers": 12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 10,
+            "num_epochs": 3,
             
             # Optimization
             "learning_rate": 3e-4,
-            "gradient_accumulation_steps": 2,
+            "gradient_accumulation_steps": 4,
             "warmup_ratio": 0.1,  
             
             # Checkpointing
@@ -494,7 +494,7 @@ if __name__ == "__main__":
         "wandb": {
             "enabled": True,
             "project": "VeS-love",
-            "name": "temploss-10.0",
+            "name": "temploss-1.0-scaleinv-fullhubert-infonce",
             "log_freq": 1, 
             "watch_model": False,  
         },
