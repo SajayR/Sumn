@@ -110,7 +110,7 @@ class VeSTrainer:
         )
         self.steps_per_epoch = len(self.dataloader)
         
-        self.model = VeS().to(self.device)
+        self.model = VeS(loss_type="dense").to(self.device)
         #self.model.visual_embedder.fuse_lora()
         #torch._dynamo.reset()
         #self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=False)#, fullgraph=True)#, dynamic=False)
@@ -136,6 +136,7 @@ class VeSTrainer:
 
         self.global_step = 0
         self.current_epoch = 0
+        self.epoch_step = 0  # Track step within current epoch
         self.best_loss   = float("inf")
         if self.use_wandb:
             self._init_wandb(config)
@@ -248,10 +249,15 @@ class VeSTrainer:
             return False
 
     def save_checkpoint(self, epoch: int, step: int):
+        # Calculate the actual step within the current epoch
+        steps_per_epoch = self.steps_per_epoch
+        epoch_step = self.global_step % steps_per_epoch if steps_per_epoch > 0 else 0
+        
         ckpt = {
             "epoch": epoch,
             "step": step,
             "global_step": self.global_step,
+            "epoch_step": epoch_step,  # Step within current epoch for mid-epoch resume
             "model_state": self.model.state_dict(),
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
@@ -267,7 +273,7 @@ class VeSTrainer:
         temp = self._ckpt_path(epoch, step).with_suffix(".temp.pt")
         torch.save(ckpt, temp)
         temp.rename(self._ckpt_path(epoch, step))
-        self.logger.info(f"Saved checkpoint – epoch {epoch}, step {step}")
+        self.logger.info(f"Saved checkpoint – epoch {epoch}, step {step}, epoch_step {epoch_step}")
 
     def load_checkpoint(self, checkpoint_path: str | Path):
         """Load checkpoint and restore exact training state."""
@@ -286,6 +292,7 @@ class VeSTrainer:
         # Restore training progress
         self.global_step = ckpt.get("global_step", ckpt["step"])
         self.current_epoch = ckpt["epoch"]
+        self.epoch_step = ckpt.get("epoch_step", 0)  # Restore step within epoch
         self.best_loss = ckpt.get("best_loss", float("inf"))
         
         # Restore random states for deterministic continuation
@@ -300,7 +307,7 @@ class VeSTrainer:
         if "data_generator_state" in ckpt:
             self.data_generator.set_state(ckpt["data_generator_state"])
         
-        print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}")
+        print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}, epoch_step {self.epoch_step}")
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
 
     def print_trainable_params(self, stage_name=""):
@@ -350,7 +357,45 @@ class VeSTrainer:
 
             epoch_losses = []
             
-            pbar = tqdm(enumerate(self.dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
+            # Deterministic reshuffling: Set epoch-specific seed
+            # This ensures different shuffling per epoch but reproducible across runs
+            epoch_seed = self.data_seed + epoch * 1000  # Multiply by 1000 to ensure different seeds
+            self.data_generator.manual_seed(epoch_seed)
+            print(f"Epoch {epoch}: Using deterministic seed {epoch_seed} for data shuffling")
+            
+            # Also update worker seeds for this epoch
+            def epoch_worker_init_fn(worker_id):
+                worker_seed = epoch_seed + worker_id
+                np.random.seed(worker_seed)
+                random.seed(worker_seed)
+                torch.manual_seed(worker_seed)
+            
+            # Create a new DataLoader with the epoch-specific seed
+            # This is necessary because we can't change the generator state of an existing DataLoader
+            epoch_dataloader = DataLoader(
+                self.dataloader.dataset,
+                batch_size=self.batch_size,
+                num_workers=10,
+                pin_memory=True,
+                persistent_workers=True,
+                drop_last=True,
+                shuffle=True,
+                generator=self.data_generator,
+                worker_init_fn=epoch_worker_init_fn,
+                pin_memory_device="cuda"
+            )
+            
+            # Determine if we need to skip steps (for mid-epoch resume)
+            steps_to_skip = 0
+            if epoch == self.current_epoch and self.epoch_step > 0:
+                steps_to_skip = self.epoch_step
+                print(f"Resuming from epoch {epoch}, skipping first {steps_to_skip} steps")
+            
+            pbar = tqdm(enumerate(epoch_dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
+            
+            # Reset epoch_step at the beginning of a new epoch
+            if epoch != self.current_epoch:
+                self.epoch_step = 0
 
             accumulation_counter = 0
             '''print("\n=== LoRA Parameter Verification ===")
@@ -361,6 +406,11 @@ class VeSTrainer:
                     print(f"WARNING: LoRA param not trainable: {name}")
             print("=== End Verification ===\n")'''
             for step, batch in pbar:
+                # Skip already processed steps when resuming mid-epoch
+                if step < steps_to_skip:
+                    pbar.set_postfix({"status": f"Skipping processed step {step}/{steps_to_skip-1}"})
+                    continue
+                    
                 #if step<200:
                 #    continue
                 if step >= self.steps_per_epoch:
@@ -422,7 +472,7 @@ class VeSTrainer:
                 # Log to wandb
                 if self.use_wandb and self.global_step % self.cfg_wandb.get("log_freq", 10) == 0:
                     current_lr = self.scheduler.get_last_lr()[0] if self.scheduler.get_last_lr() else self.learning_rate
-                    wandb.log({
+                    to_log={
                         "train/loss": loss_val,
                         "train/learning_rate": current_lr,
                         "train/epoch": epoch,
@@ -430,14 +480,19 @@ class VeSTrainer:
                         "train/l_nonneg": outputs["l_nonneg"].item(),
                         "train/l_tv": outputs["l_tv"].item(),
                         "train/logit_scale": self.model.logit_scale.exp().item(),
-                        #"bias": self.model.bias.item(),
-                        #"logit_scale": self.model.logit_scale.item(),
-                    }, step=self.global_step)
+                    }
+                    if "dense_loss" in outputs:
+                        to_log["train/dense_loss"] = outputs["dense_loss"].item()
+                    if "global_loss" in outputs:
+                        to_log["train/global_loss"] = outputs["global_loss"].item()
+                    wandb.log(to_log, step=self.global_step)
+
 
                 if self.global_step % self.checkpoint_every_steps == 0 and self.global_step != 0:
                     self.save_checkpoint(epoch, self.global_step)
 
                 self.global_step += 1
+                self.epoch_step = step + 1  # Track current step within epoch
 
             # --- epoch end --------------------------------------------------
             self.current_epoch = epoch + 1

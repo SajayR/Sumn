@@ -265,7 +265,7 @@ class VisionEncoder(nn.Module):
 class VeS(nn.Module):
     def __init__(
         self, 
-        freeze_hubert_initially=True,
+        loss_type="dense",
     ):
         super().__init__()
 
@@ -276,6 +276,9 @@ class VeS(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.loss_type = loss_type
+        assert self.loss_type in ["dense", "dense_global", "global"], "Invalid loss type"
+        
 
         self.tv_weight = 0.1
 
@@ -457,7 +460,7 @@ class VeS(nn.Module):
 
         return total_loss, l_nonneg, l_tv
     
-    '''
+    
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
         """ InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
@@ -475,6 +478,48 @@ class VeS(nn.Module):
         reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)    
         total_loss = contrastive_loss + reg_loss
         return total_loss, l_nonneg, l_tv
+    '''
+
+    def compute_contrastive_loss(self, clip_sims, token_sims, attention_mask, audio_feats=None, visual_feats=None, global_weight=0.5):
+        """ InfoNCE loss with regularization + optional global mean-pooled loss"""
+        batch_size = clip_sims.shape[0]
+        if self.loss_type == "dense" or self.loss_type == "dense_global":
+            # Existing token-level loss
+            labels = torch.arange(batch_size).to(clip_sims.device)
+            # Audio to Visual direction
+            log_prob_a2v = F.log_softmax(clip_sims, dim=1)
+            losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
+            # Visual to Audio direction  
+            log_prob_v2a = F.log_softmax(clip_sims.t(), dim=1)
+            losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
+            # Average both directions
+            token_contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
+        else:
+            token_contrastive_loss = 0.0
+            
+        global_contrastive_loss = 0.0
+        if self.loss_type == "global" or self.loss_type == "dense_global":
+            #masked mean 
+            mask_expanded = attention_mask.unsqueeze(-1).float()  # [B, Na, 1]
+            audio_global = (audio_feats * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1).clamp(min=1e-6)  # [B, D]
+            
+            visual_global = visual_feats.mean(dim=1)  # [B, D]
+            global_sims = torch.matmul(audio_global, visual_global.t()) * self.logit_scale.exp().clamp(max=100)  # [B, B]
+            
+            # Global InfoNCE loss
+            log_prob_a2v_global = F.log_softmax(global_sims, dim=1)
+            losses_a2v_global = -log_prob_a2v_global[torch.arange(batch_size), labels]
+            log_prob_v2a_global = F.log_softmax(global_sims.t(), dim=1)
+            losses_v2a_global = -log_prob_v2a_global[torch.arange(batch_size), labels]
+            
+            global_contrastive_loss = (losses_a2v_global + losses_v2a_global).mean() / 2
+        
+        contrastive_loss = (1 - global_weight) * token_contrastive_loss + global_weight * global_contrastive_loss
+        
+        reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)    
+        total_loss = contrastive_loss + reg_loss
+        
+        return total_loss, l_nonneg, l_tv, token_contrastive_loss, global_contrastive_loss
     
         
     
@@ -501,7 +546,37 @@ class VeS(nn.Module):
             audio_attention_mask
         )
 
-        loss, l_nonneg, l_tv = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
+        #loss, l_nonneg, l_tv = self.compute_contrastive_loss(clip_sims, token_sims, audio_attention_mask)
+        if self.loss_type == "dense":
+            loss, l_nonneg, l_tv, dense_loss, global_loss = self.compute_contrastive_loss(
+                clip_sims, 
+                token_sims, 
+                audio_attention_mask,
+                audio_feats=None,     
+                visual_feats=None,    
+                global_weight=0.0             
+            )
+        elif self.loss_type == "dense_global":
+            loss, l_nonneg, l_tv, dense_loss, global_loss = self.compute_contrastive_loss(
+                clip_sims, 
+                token_sims, 
+                audio_attention_mask,
+                audio_feats=audio_feats,     
+                visual_feats=visual_feats,    
+                global_weight=0.30             
+            )
+        elif self.loss_type == "global":
+            loss, l_nonneg, l_tv, dense_loss, global_loss = self.compute_contrastive_loss(
+                clip_sims, 
+                token_sims, 
+                audio_attention_mask,
+                audio_feats=audio_feats,     
+                visual_feats=visual_feats,    
+                global_weight=1.0             
+            )
+        else:
+            raise ValueError(f"Invalid loss type: {self.loss_type}")
+        
         return {
             'loss': loss,
             'clip_sims': clip_sims.detach(),
@@ -510,7 +585,9 @@ class VeS(nn.Module):
             'audio_attention_mask': audio_attention_mask.detach(),
             'token_sims': token_sims.detach(),
             'l_nonneg': l_nonneg.detach(),
-            'l_tv': l_tv.detach()
+            'l_tv': l_tv.detach(),
+            'dense_loss': dense_loss.detach(),
+            'global_loss': global_loss.detach()
         }
 
     def unfreeze_hubert(self):

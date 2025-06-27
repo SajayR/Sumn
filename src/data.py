@@ -107,7 +107,7 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
 class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
     
     def __init__(self, 
-                 completed_audio_path="/speedy/CisStuff/dataset/completed_audio_files.txt",
+                 completed_audio_path="/speedy/CisStuff/dataset/completed_audio_files_disk.txt",
                  json_mapping_path="/speedy/CisStuff/dataset/hindi_filtered_dataset.json",
                  data_base_path="/speedy/Vaani",
                  crop_strategy="pad_square", 
