@@ -102,7 +102,7 @@ class VeSTrainer:
             pin_memory=True,
             persistent_workers=True,
             drop_last=True,
-            prefetch_factor=6,
+            #prefetch_factor=6,
             shuffle=True,
             generator=self.data_generator, 
             worker_init_fn=worker_init_fn, 
@@ -469,7 +469,7 @@ if __name__ == "__main__":
             
             # Data settings
             "batch_size": 54,
-            "num_workers": 12,
+            "num_workers": 6, #12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
@@ -492,7 +492,7 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
+            "enabled": False,
             "project": "VeS-love",
             "name": "temploss-1.0-scaleinv-fullhubert-infonce",
             "log_freq": 1, 

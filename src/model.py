@@ -34,25 +34,25 @@ class AudioEmbedder(nn.Module):
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
+            #bnb_4bit_use_double_quant=True,
         )
 
         self.hubert = AutoModel.from_pretrained(
             hubert_name,
             #quantization_config=quant_cfg,
-            device_map="auto"
+            device_map="auto",
+            torch_dtype=torch.bfloat16
         )
-
+       
+      
         lora_cfg = LoraConfig(
-            r=16,
-            lora_alpha=32,
+            r=64,
+            lora_alpha=64,
             target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
             bias="none",
         )
 
-        #self.hubert = get_peft_model(self.hubert, lora_cfg)
-
-        #self.hubert.forward = torch._dynamo.disable(self.hubert.forward)   # ← NEW
+        self.hubert = get_peft_model(self.hubert, lora_cfg)
         self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
@@ -111,9 +111,7 @@ class AudioEmbedder(nn.Module):
             return_dict=True,
         ).last_hidden_state                    # (B, Na, H)
         
-        ## Convert back to float32 for projection layers
-        #hubert_out = hubert_out.to(dtype=torch.float32)
-
+   
         REDUCTION = 2
         hubert_out = hubert_out.transpose(1, 2)                # (B, H, Na)
         hubert_out = F.avg_pool1d(
@@ -151,11 +149,12 @@ class VisionEncoder(nn.Module):
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
+                #bnb_4bit_use_double_quant=True,
             )
 
-        self.model = AutoModel.from_pretrained('facebook/dinov2-base', device_map="auto")#, quantization_config=quantization_config, device_map="auto")
+        self.model = AutoModel.from_pretrained('facebook/dinov2-base', device_map="auto", torch_dtype=torch.bfloat16)#, quantization_config=quantization_config)
         self.model.gradient_checkpointing_enable()
+        #self.model = prepare_model_for_kbit_training(self.model)
         for param in self.model.parameters():
             param.requires_grad = False
 
@@ -171,8 +170,8 @@ class VisionEncoder(nn.Module):
 
         lora_config = LoraConfig(
             inference_mode=False,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
+            r=8,
+            lora_alpha=16,
             target_modules=lora_target_modules, 
             bias="none",          
             #modules_to_save=None,  
@@ -194,6 +193,8 @@ class VisionEncoder(nn.Module):
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
+            param.requires_grad = True
+        for param in self.layer_norm.parameters():
             param.requires_grad = True
 
     def fuse_lora(self):
@@ -223,12 +224,12 @@ class VisionEncoder(nn.Module):
                 D  = embedding_dim
         """
         #print("Dino input shape: ", x.shape)
-        outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
-        patches = outputs.last_hidden_state[:,1:, :] #5 cause 1 is the cls token, 4 are registers
-        #feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        proj1 = self.projection1(patches)
-        normed = self.layer_norm(proj1)
-        feats = self.projection2(normed)
+        patches = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False).last_hidden_state[:,1:, :]
+        #patches = outputs.last_hidden_state[:,1:, :] #5 cause 1 is the cls token, 4 are registers
+        feats = self.projection2(self.layer_norm(self.projection1(patches)))
+        #proj1 = self.projection1(patches)
+        #normed = self.layer_norm(proj1)
+        #feats = self.projection2(normed)
         #if self.training:
             #feats = self.patch_dropout(feats, self.patch_dropout_rate)
         feats = F.normalize(feats, dim=-1)
@@ -296,9 +297,6 @@ class VeS(nn.Module):
             print(f"Warning: Attention mask length ({Na_mask}) != audio feats length ({Na_audio})")
             raise ValueError(f"Attention mask and audio features have mismatched sequence lengths: {Na_mask} vs {Na_audio}")
 
-        #af = audio_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Na, D)
-        #vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
-
         # token-level sim
         #token_sims = torch.matmul(af, vf.transpose(2, 3))           # (B, B, Na, Nv)
 
@@ -307,16 +305,10 @@ class VeS(nn.Module):
             audio_feats, visual_feats
         ) 
 
-        
-        # Create expanded mask for token_sims
-        #a_mask = attention_mask.unsqueeze(1).unsqueeze(3).float().expand(-1, B, -1, vf.size(2))  # (B, B, Na, Nv)
+        mask    = attention_mask[:, None, :, None]           # (B,1,Na,1)  broadcast
 
-        Nv = visual_feats.size(1)
-        a_mask = attention_mask[:, None, :, None].expand(-1, B, -1, Nv)
-        
-        # Mask out padded tokens BEFORE max operations
-        masked_token_sims = token_sims.clone()
-        masked_token_sims[a_mask == 0] = float('-inf')  # Set padded positions to -inf
+        masked_token_sims = torch.where(mask.bool(), token_sims, float('-inf'))
+
 
         # 1) audio → visual • max over patches, mean over tokens
         a2v_max = masked_token_sims.max(dim=3).values               # (B, B, Na)
@@ -443,7 +435,7 @@ class VeS(nn.Module):
     
     '''
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
-        """Compute InfoNCE loss with regularization"""
+        """ InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
         
         
