@@ -587,7 +587,7 @@ class VeS(nn.Module):
             'l_nonneg': l_nonneg.detach(),
             'l_tv': l_tv.detach(),
             'dense_loss': dense_loss.detach(),
-            'global_loss': global_loss.detach()
+            'global_loss': global_loss.detach() if isinstance(global_loss, torch.Tensor) else global_loss
         }
 
     def unfreeze_hubert(self):

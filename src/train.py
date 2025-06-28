@@ -248,10 +248,10 @@ class VeSTrainer:
             print("No existing checkpoints found, starting training from scratch")
             return False
 
-    def save_checkpoint(self, epoch: int, step: int):
-        # Calculate the actual step within the current epoch
-        steps_per_epoch = self.steps_per_epoch
-        epoch_step = self.global_step % steps_per_epoch if steps_per_epoch > 0 else 0
+    def save_checkpoint(self, epoch: int, step: int, current_epoch_step: int = None):
+        # Use the provided current_epoch_step or fall back to tracked epoch_step
+        epoch_step = current_epoch_step if current_epoch_step is not None else self.epoch_step
+        print(f"DEBUG: Saving checkpoint with epoch_step={epoch_step} (provided={current_epoch_step}, tracked={self.epoch_step})")
         
         ckpt = {
             "epoch": epoch,
@@ -294,18 +294,43 @@ class VeSTrainer:
         self.current_epoch = ckpt["epoch"]
         self.epoch_step = ckpt.get("epoch_step", 0)  # Restore step within epoch
         self.best_loss = ckpt.get("best_loss", float("inf"))
+        print(f"DEBUG: Loaded checkpoint with epoch_step={self.epoch_step} from saved checkpoint")
         
         # Restore random states for deterministic continuation
-        if "torch_rng_state" in ckpt:
-            torch.set_rng_state(ckpt["torch_rng_state"])
-        if "cuda_rng_state" in ckpt and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(ckpt["cuda_rng_state"])
+        # Handle RNG states carefully to avoid device/type issues
+        try:
+            if "torch_rng_state" in ckpt:
+                rng_state = ckpt["torch_rng_state"]
+                # Ensure the RNG state is on CPU and is a ByteTensor
+                if hasattr(rng_state, 'cpu'):
+                    rng_state = rng_state.cpu()
+                if not isinstance(rng_state, torch.ByteTensor):
+                    if hasattr(rng_state, 'byte'):
+                        rng_state = rng_state.byte()
+                torch.set_rng_state(rng_state)
+        except Exception as e:
+            print(f"Warning: Could not restore torch RNG state: {e}")
+            
+            
         if "numpy_rng_state" in ckpt:
             np.random.set_state(ckpt["numpy_rng_state"])
         if "python_rng_state" in ckpt:
             random.setstate(ckpt["python_rng_state"])
-        if "data_generator_state" in ckpt:
-            self.data_generator.set_state(ckpt["data_generator_state"])
+        
+        try:
+            if "data_generator_state" in ckpt:
+                generator_state = ckpt["data_generator_state"]
+                # Ensure the generator state is on CPU and is a ByteTensor
+                if hasattr(generator_state, 'cpu'):
+                    generator_state = generator_state.cpu()
+                if not isinstance(generator_state, torch.ByteTensor):
+                    if hasattr(generator_state, 'byte'):
+                        generator_state = generator_state.byte()
+                self.data_generator.set_state(generator_state)
+        except Exception as e:
+            print(f"Warning: Could not restore data generator RNG state: {e}")
+            # Fallback: Reset data generator with the original seed
+            self.data_generator.manual_seed(self.data_seed)
         
         print(f"Resumed from epoch {self.current_epoch}, step {self.global_step}, epoch_step {self.epoch_step}")
         self.logger.info(f"Loaded checkpoint from {checkpoint_path}")
@@ -484,12 +509,12 @@ class VeSTrainer:
                     if "dense_loss" in outputs:
                         to_log["train/dense_loss"] = outputs["dense_loss"].item()
                     if "global_loss" in outputs:
-                        to_log["train/global_loss"] = outputs["global_loss"].item()
+                        to_log["train/global_loss"] = outputs["global_loss"].item() if isinstance(outputs["global_loss"], torch.Tensor) else outputs["global_loss"]
                     wandb.log(to_log, step=self.global_step)
 
 
                 if self.global_step % self.checkpoint_every_steps == 0 and self.global_step != 0:
-                    self.save_checkpoint(epoch, self.global_step)
+                    self.save_checkpoint(epoch, self.global_step, step + 1)
 
                 self.global_step += 1
                 self.epoch_step = step + 1  # Track current step within epoch
@@ -506,7 +531,7 @@ class VeSTrainer:
                     "epoch/epoch": epoch,
                 }, step=self.global_step)
                 
-            self.save_checkpoint(epoch, self.global_step)
+            self.save_checkpoint(epoch, self.global_step, self.epoch_step)
 
         print("Training completed!")
         
