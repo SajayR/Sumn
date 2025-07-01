@@ -29,15 +29,11 @@ class AudioEmbedder(nn.Module):
 
     def __init__(self, embedding_dim=256, hubert_name="ntu-spml/distilhubert"):
         super().__init__()
-
-
         self.hubert = AutoModel.from_pretrained(
             hubert_name,
             device_map="auto",
             torch_dtype=torch.bfloat16
         )
-       
-      
         lora_cfg = LoraConfig(
             r=128,
             lora_alpha=128,
@@ -133,110 +129,30 @@ class AudioEmbedder(nn.Module):
     
     def unfreeze_hubert(self):
         pass
-'''
+
+
 class VisionEncoder(nn.Module):
-
-    def __init__(self, embedding_dim=256, patch_dropout_prob=0.1, freeze_dino=False):
+    def __init__(self, embedding_dim=256, use_cached_features=False):
         super().__init__()
-
-        self.model = AutoModel.from_pretrained('facebook/dinov2-base', device_map="auto", torch_dtype=torch.bfloat16)#, quantization_config=quantization_config)
-        self.model.gradient_checkpointing_enable()
-        #self.model = prepare_model_for_kbit_training(self.model)
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        lora_target_modules = [
-            "attention.attention.query",
-            "attention.attention.key",
-            "attention.attention.value",
-            "attention.output.dense",
-            # ff
-            # "mlp.fc1",
-            # "mlp.fc2",
-        ]
-
-        lora_config = LoraConfig(
-            inference_mode=False,
-            r=8,
-            lora_alpha=16,
-            target_modules=lora_target_modules, 
-            bias="none",          
-            #modules_to_save=None,  
-        )
-
-        self.model = get_peft_model(self.model, lora_config)
-    
-        self.projection1 = nn.Linear(self.model.config.hidden_size, 256)
-        self.layer_norm = nn.LayerNorm(256)
-        self.projection2 = nn.Linear(256, embedding_dim)
-        self.patch_dropout_rate = patch_dropout_prob
-        self.patch_dropout = self.patch_dropout_layer
-
-        for name, param in self.model.named_parameters():
-            if 'lora_' not in name: 
+        self.use_cached_features = use_cached_features
+        
+        if not use_cached_features:
+            self.model = AutoModel.from_pretrained('facebook/dinov2-large')
+            for param in self.model.parameters():
                 param.requires_grad = False
-            else:
-                param.requires_grad = True
-        for param in self.projection1.parameters():
-            param.requires_grad = True
-        for param in self.projection2.parameters():
-            param.requires_grad = True
-        for param in self.layer_norm.parameters():
-            param.requires_grad = True
-
-    def fuse_lora(self):
-        self.model = self.model.merge_and_unload() 
-
-    def patch_dropout_layer(self, x: torch.Tensor, drop_p: float):
-        """
-        x : (B, N, D) 
-        """
-        if not self.training or drop_p == 0:
-            return x
-
-        B, N, D = x.shape
-        keep_mask = (torch.rand(B, N, 1, device=x.device) > drop_p)
-        x = x * keep_mask 
-        keep_counts = keep_mask.sum(dim=1, keepdim=True).clamp_min(1)
-        x = x * N / keep_counts
-        return x
-
-    def forward(self, x):
-        """
-        Args:
-            x: (B, 3, H, W), e.g. (B,3,224,224) image batch
-        Returns:
-            visual_feats: (B, Nv, D)
-                Nv = number of visual tokens
-                D  = embedding_dim
-        """
-        #print("Dino input shape: ", x.shape)
-        patches = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False).last_hidden_state[:,1:, :]
-        #patches = outputs.last_hidden_state[:,1:, :] #5 cause 1 is the cls token, 4 are registers
-        feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        #proj1 = self.projection1(patches)
-        #normed = self.layer_norm(proj1)
-        #feats = self.projection2(normed)
-        #if self.training:
-            #feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        feats = F.normalize(feats, dim=-1)
-        #print("Dino output shape: ", feats.shape)
-        return feats
-'''
-
-class VisionEncoder(nn.Module):
-    def __init__(self, embedding_dim=256):
-        super().__init__()
-        self.model = AutoModel.from_pretrained('facebook/dinov2-base')
-        for param in self.model.parameters():
-            param.requires_grad = False
-            
-        hidden_size = self.model.config.hidden_size  
+            hidden_size = self.model.config.hidden_size
+            self.model.eval()
+            print("Using DinoV2")
+        else:
+            # Skip loading DinoV2 when using cached features
+            self.model = None
+            print("Not using DinoV2")
+            hidden_size = 768  # DinoV2-base hidden size
         
         self.adapter = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
                 d_model=hidden_size,
-                nhead=12,
+                nhead=8,
                 dim_feedforward=hidden_size * 4,
                 batch_first=True
             ),
@@ -247,13 +163,45 @@ class VisionEncoder(nn.Module):
             nn.LayerNorm(256),
             nn.Linear(256, embedding_dim)
         )
+    
+    def forward_cached_features(self, cached_features):
+        """Process cached DinoV2 features through adapter and projection.
         
-    def forward(self, x):
+        Args:
+            cached_features: (B, N+1, 768) cached DinoV2 features
+            
+        Returns:
+            patch_embeds: (B, N, embedding_dim) normalized patch embeddings
+        """
+        adapted = self.adapter(cached_features)  # (B, N+1, 768)
+        patches = adapted[:, 1:]    # (B, N, 768) - skip CLS token
+        patch_embeds = self.projection(patches)  # (B, N, embedding_dim)
+        patch_embeds = F.normalize(patch_embeds, dim=-1)
+        return patch_embeds
+        
+    def forward(self, x=None, cached_features=None):
+        """Forward pass - either from images or cached features.
+        
+        Args:
+            x: (B, 3, H, W) image tensors (required if not using cached features)
+            cached_features: (B, N+1, 768) cached DinoV2 features (optional)
+            
+        Returns:
+            patch_embeds: (B, N, embedding_dim) normalized patch embeddings
+        """
+        if cached_features is not None:
+            return self.forward_cached_features(cached_features)
+            
+        if self.use_cached_features:
+            raise ValueError("VisionEncoder configured for cached features but none provided")
+            
+        if x is None:
+            raise ValueError("Either x or cached_features must be provided")
+            
         with torch.no_grad():
             features = self.model(x).last_hidden_state  # [B, N+1, 768]
 
         adapted = self.adapter(features)  # Still [B, N+1, 768]
-        cls_token = adapted[:, 0]  # [B, 768]
         patches = adapted[:, 1:]    # [B, N, 768]
         patch_embeds = self.projection(patches)  # [B, N, 256]
         patch_embeds = F.normalize(patch_embeds, dim=-1)
@@ -266,15 +214,17 @@ class VeS(nn.Module):
     def __init__(
         self, 
         loss_type="dense",
+        use_cached_visual_features=False,
     ):
         super().__init__()
 
-        self.visual_embedder = VisionEncoder()  
+        self.visual_embedder = VisionEncoder(use_cached_features=use_cached_visual_features)  
         self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960")
-        #self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
-        #self.bias = nn.Parameter(torch.tensor(-10.0))
+        self.use_cached_visual_features = use_cached_visual_features
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
+        self.bias = nn.Parameter(torch.tensor(-10.0))
 
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
+        #self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.loss_type = loss_type
         assert self.loss_type in ["dense", "dense_global", "global"], "Invalid loss type"
@@ -416,8 +366,8 @@ class VeS(nn.Module):
         return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
 
 
-    '''
-    def compute_contrastive_loss(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor): #sigmoid
+    
+    def compute_contrastive_loss(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor, audio_feats: torch.Tensor = None, visual_feats: torch.Tensor = None, global_weight: float = 0.0 ): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
         Algorithm 1 Sigmoid loss pseudo-implementation.
@@ -458,9 +408,9 @@ class VeS(nn.Module):
 
         total_loss = pairwise_loss + reg_loss
 
-        return total_loss, l_nonneg, l_tv
+        return total_loss, l_nonneg, l_tv, pairwise_loss, 0.0
     
-    
+    '''
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
         """ InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
@@ -479,7 +429,7 @@ class VeS(nn.Module):
         total_loss = contrastive_loss + reg_loss
         return total_loss, l_nonneg, l_tv
     '''
-
+    '''
     def compute_contrastive_loss(self, clip_sims, token_sims, attention_mask, audio_feats=None, visual_feats=None, global_weight=0.5):
         """ InfoNCE loss with regularization + optional global mean-pooled loss"""
         batch_size = clip_sims.shape[0]
@@ -520,16 +470,18 @@ class VeS(nn.Module):
         total_loss = contrastive_loss + reg_loss
         
         return total_loss, l_nonneg, l_tv, token_contrastive_loss, global_contrastive_loss
-    
+    '''    
         
     
-    def forward(self, audio_input, images, attention_mask=None):
+    def forward(self, audio_input, images=None, attention_mask=None, cached_visual_features=None):
         """
         Forward pass of VeS model.
         
         Args:
             audio_input: (B, T) raw audio waveform at 16kHz
-            images: PIL Images or preprocessed image tensors
+            images: (B, 3, H, W) preprocessed image tensors (optional if using cached features)
+            attention_mask: (B, T) audio attention mask
+            cached_visual_features: (B, N+1, 768) cached DinoV2 features (optional)
             
         Returns:
             dict containing:
@@ -539,7 +491,14 @@ class VeS(nn.Module):
                 - visual_feats: (B, Nv, D) visual features
         """
         audio_feats, audio_attention_mask = self.audio_embedder(audio_input, attention_mask)
-        visual_feats = self.visual_embedder(images)
+        
+        if cached_visual_features is not None:
+            visual_feats = self.visual_embedder(cached_features=cached_visual_features)
+        elif images is not None:
+            print("Cached features not provided, using images")
+            visual_feats = self.visual_embedder(images)
+        else:
+            raise ValueError("Either images or cached_visual_features must be provided")
         clip_sims, token_sims = self.compute_all_similarities_tv(
             audio_feats, 
             visual_feats, 

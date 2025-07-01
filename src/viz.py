@@ -350,7 +350,50 @@ class VeSVisualizer:
         outputs – dict coming out of model.forward(); MUST include
                   "token_sims" (B,B,Na,Nv)
         """
-        imgs   = batch["image"].cpu()                       # (B,3,224,224)
+        if "image" not in batch:  # Using cached features, need to load images
+            # Load images from paths for visualization
+            image_paths = batch["image_path"]  # List of paths
+            crop_infos = batch["crop_info"]
+            
+            imgs = []
+            for i, img_path in enumerate(image_paths):
+                # Load without augmentations for clean viz
+                from PIL import Image as PILImage
+                import torchvision.transforms as transforms
+                
+                image = PILImage.open(img_path).convert('RGB')
+                
+                # Apply the same crop strategy that was used during training
+                # (but without augmentations)
+                crop_strategy = crop_infos[i]["crop_strategy"] if i < len(crop_infos) else "pad_square"
+                target_size = crop_infos[i]["target_size"] if i < len(crop_infos) else 224
+                
+                if crop_strategy == "pad_square":
+                    width, height = image.size
+                    max_dim = max(width, height)
+                    new_image = PILImage.new('RGB', (max_dim, max_dim), color=(0, 0, 0))
+                    paste_x = (max_dim - width) // 2
+                    paste_y = (max_dim - height) // 2
+                    new_image.paste(image, (paste_x, paste_y))
+                    image = new_image.resize((target_size, target_size), PILImage.LANCZOS)
+                # Add other crop strategies as needed...
+                
+                # Convert to tensor without augmentations
+                transform = transforms.Compose([
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]
+                    )
+                ])
+                
+                imgs.append(transform(image))
+            
+            imgs = torch.stack(imgs).cpu()  # (B, 3, 224, 224)
+        else:
+            # Images were loaded by dataset
+            imgs = batch["image"].cpu()
+
         audio  = batch["audio"].cpu().numpy()               # (B,T)
         sr     = batch["sampling_rate"]                     # list[int] or int
         attn   = outputs["audio_attention_mask"].cpu()        # (B,Na)

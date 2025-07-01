@@ -16,13 +16,15 @@ import torchvision.transforms as transforms
 import torchaudio
 import torchaudio.transforms as T
 from transformers import AutoProcessor
+from pathlib import Path
 
-def process_image(image_path, crop_strategy="pad_square", target_size=224):
+def process_image(image_path, crop_strategy="pad_square", target_size=224, use_augmentations=True):
     """
     Args:
         image_path: Path to image file
         crop_strategy: One of ["stretch", "center_crop", "random_crop", "pad_square"]
         target_size: Target size (224 for ViT)
+        use_augmentations: Whether to apply data augmentations (set False when using cached features)
     
     Returns:
         tuple: (torch.Tensor, dict) - Normalized image tensor [3, 224, 224] and original dimensions info
@@ -71,50 +73,54 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224):
     else:
         raise ValueError(f"Unknown crop_strategy: {crop_strategy}")
     
-
-    '''transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],  
-            std=[0.229, 0.224, 0.225]  
-        )
-    ])'''
-
-    transform = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        #transforms.RandomRotation(degrees=10),
-       # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        #transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
+    # Choose transform based on whether we want augmentations
+    if use_augmentations:
+        # Training transforms with augmentations
+        transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.5),
+            #transforms.RandomRotation(degrees=10),
+           # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            #transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+    else:
+        # Deterministic transforms (consistent with cache)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
     
     # Create crop info for later use
     crop_info = {
         "original_width": original_width,
         "original_height": original_height,
         "crop_strategy": crop_strategy,
-        "target_size": target_size
+        "target_size": target_size,
+        "augmentations_used": use_augmentations
     }
     
     return transform(image), crop_info
 
 
-# Change from IterableDataset to Dataset
-class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
+class VAAPairedDataset(torch.utils.data.Dataset):
     
     def __init__(self, 
-                 completed_audio_path="/speedy/CisStuff/dataset/completed_audio_files_disk.txt",
-                 json_mapping_path="/speedy/CisStuff/dataset/hindi_filtered_dataset.json",
+                 json_dir_path="/speedy/CisStuff/VeS/vaani_data",  # Now it's a directory!
                  data_base_path="/speedy/Vaani",
                  crop_strategy="pad_square", 
                  target_size=224,
                  max_audio_duration=5.0,
                  sampling_rate=16000,
-                 debug=False):
+                 debug=False,
+                 cached_features_base_path=None,
+                 is_validation=False):  # Add this to know which JSONs to load
         super().__init__()
         
         self.data_base_path = data_base_path
@@ -122,79 +128,73 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
         self.target_size = target_size
         self.max_audio_duration = max_audio_duration
         self.sampling_rate = sampling_rate
-        self.resampler = None  # Initialize resampler as None
+        self.resampler = None
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         
-        print("Loading completed audio files list...")
-        with open(completed_audio_path, 'r') as f:
-            self.completed_audio_files = [line.strip() for line in f.readlines()]
-        print(f"Loaded {len(self.completed_audio_files)} completed audio files")
+        # Cached features setup
+        self.cached_features_base_path = cached_features_base_path
+        if cached_features_base_path is not None:
+            print(f"Using cached visual features from: {cached_features_base_path}")
+            cache_path = Path(cached_features_base_path)
+            if cache_path.exists():
+                pt_files = list(cache_path.rglob("*.pt"))
+                print(f"Found {len(pt_files)} cached .pt files in directory")
         
-        print("Loading JSON mapping...")
-        with open(json_mapping_path, 'r') as f:
-            mapping_data = json.load(f)
+        # Load all the mappings from JSONs
+        json_dir = Path(json_dir_path)
         
-        # Create a mapping from audioFileName to imageFileName
-        self.audio_to_image_map = {}
-        for item in mapping_data:
-            self.audio_to_image_map[item['audioFileName']] = item['imageFileName']
-        print(f"Loaded {len(self.audio_to_image_map)} audio-image mappings")
+        if is_validation:
+            # Load the single validation JSON
+            val_path = json_dir / "validation_set.json"
+            json_files = [val_path] if val_path.exists() else []
+        else:
+            # Load all train_*.json files
+            json_files = sorted(json_dir.glob("train_*.json"))
         
-        # Filter completed audio files to only include those with image mappings
-        self.valid_audio_files = []
-        for audio_file in self.completed_audio_files:
-            if audio_file in self.audio_to_image_map:
-                self.valid_audio_files.append(audio_file)
+        print(f"Found {len(json_files)} JSON files to load")
         
-        print(f"Found {len(self.valid_audio_files)} valid audio files with image mappings")
-
-        # In __init__:
-        # Check available backends
+        # Just load everything into a flat list!
+        self.all_mappings = []
+        
+        for json_path in tqdm(json_files, desc="Loading JSON mappings"):
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+                self.all_mappings.extend(data)
+                print(f"  {json_path.name}: {len(data)} entries")
+        
+        print(f"Total mappings loaded: {len(self.all_mappings)}")
+        
+        # Audio backend setup
         if 'sox_io' in torchaudio.list_audio_backends():
-            torchaudio.set_audio_backend('sox_io')  # Fast for many formats
+            torchaudio.set_audio_backend('sox_io')
         elif 'soundfile' in torchaudio.list_audio_backends():
-            torchaudio.set_audio_backend('soundfile')  # Good for WAV/FLAC
-                
-                # DON'T shuffle here - let DataLoader handle it
-        # random.shuffle(self.valid_audio_files)  ← Remove this line
+            torchaudio.set_audio_backend('soundfile')
 
     def __len__(self):
-        return len(self.valid_audio_files)
+        return len(self.all_mappings)
     
-    def __getitem__(self, idx):  # ← Changed from __iter__
-        # Get the specific audio file at this index
-        audio_file = self.valid_audio_files[idx]
+    def __getitem__(self, idx):
+        # Direct access to the mapping - so clean!
+        mapping = self.all_mappings[idx]
+        audio_file = mapping['audioFileName'].lstrip('/')
+        image_file = mapping['imageFileName'].lstrip('/')
         
         try:
-            # Get corresponding image file
-            image_file = self.audio_to_image_map[audio_file]
-            
             # Construct full paths
-            audio_path = os.path.join(self.data_base_path, audio_file)
-            image_path = os.path.join(self.data_base_path, image_file)
+            audio_path = Path(self.data_base_path) / audio_file
+            image_path = Path(self.data_base_path) / image_file
             
-            # Check if files exist
-            if not os.path.exists(audio_path):
-                # Return a different valid sample or raise exception
-                print(f"Warning: Audio file not found: {audio_path}")
-                # Option 1: Return next valid sample
-                return self.__getitem__((idx + 1) % len(self))
-                # Option 2: Raise exception (not recommended)
-                # raise FileNotFoundError(f"Audio file not found: {audio_path}")
-                
-            if not os.path.exists(image_path):
-                print(f"Warning: Image file not found: {image_path}")
+            # The files should exist since you validated them, but just in case...
+            if not audio_path.exists() or not image_path.exists():
+                print(f"Warning: Missing files for idx {idx}")
                 return self.__getitem__((idx + 1) % len(self))
             
-            # Load and process audio
-            waveform, sr = torchaudio.load(audio_path)
-            # waveform shape: [channels, time]
+            # Load and process audio (same as before)
+            waveform, sr = torchaudio.load(str(audio_path))
             
-            # Convert to mono if stereo
             if waveform.shape[0] > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Resample if needed
             if sr != self.sampling_rate:
                 if self.resampler is None or self.resampler.orig_freq != sr:
                     self.resampler = T.Resample(sr, self.sampling_rate)
@@ -205,7 +205,6 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
             max_samples = int(self.max_audio_duration * self.sampling_rate)
             
             if audio_tensor.shape[0] > max_samples:
-                # Random crop if longer than max duration
                 start_idx = random.randint(0, audio_tensor.shape[0] - max_samples)
                 audio_tensor = audio_tensor[start_idx:start_idx + max_samples]
 
@@ -222,38 +221,44 @@ class VAAPairedDataset(torch.utils.data.Dataset):  # ← Change this
             audio_tensor = processed.input_values.squeeze(0)
             attention_mask = processed.attention_mask.squeeze(0)
             
-            image_tensor, crop_info = process_image(image_path, self.crop_strategy, self.target_size)
+            # Check for cached visual features
+            cached_features = None
+            use_cached = False
             
-            return {
+            if self.cached_features_base_path is not None:
+                cache_base = Path(self.cached_features_base_path)
+                pt_filename = image_file.replace('.jpg', '.pt').replace('.jpeg', '.pt').replace('.png', '.pt')
+                pt_path = cache_base / pt_filename
+                
+                if pt_path.exists():
+                    try:
+                        cached_features = torch.load(pt_path, map_location='cpu')
+                        use_cached = True
+                    except Exception as e:
+                        print(f"Warning: Failed to load cached features from {pt_path}: {e}")
+                        use_cached = False
+            
+            # Process image
+            use_augmentations = not use_cached
+            image_tensor, crop_info = process_image(str(image_path), self.crop_strategy, 
+                                                    self.target_size, use_augmentations)
+            
+            result = {
                 "audio": audio_tensor,
                 "audio_attention_mask": attention_mask,
                 "sampling_rate": self.sampling_rate,
                 "image": image_tensor,
-                "audio_path": audio_path,
-                "image_path": image_path,
-                "crop_info": crop_info
+                "audio_path": str(audio_path),
+                "image_path": str(image_path),
+                "crop_info": crop_info,
+                "using_cached_features": use_cached
             }
+            
+            if use_cached and cached_features is not None:
+                result["cached_visual_features"] = cached_features
+            
+            return result
             
         except Exception as e:
             print(f"Error processing {audio_file}: {e}")
-            # Return next valid sample
             return self.__getitem__((idx + 1) % len(self))
-
-
-
-'''
-Loaded 2540518 completed audio files
-Loading JSON mapping...
-Loaded 6795660 audio-image mappings
-Found 2540518 valid audio files with image mappings
-'''
-
-
-if __name__ == "__main__":
-    dataset = VAAPairedDataset(debug=True)
-    import time
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True, prefetch_factor=6)
-    for batch in dataloader:
-        pass
-
-        
