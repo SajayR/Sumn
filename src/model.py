@@ -147,7 +147,7 @@ class VisionEncoder(nn.Module):
             # Skip loading DinoV2 when using cached features
             self.model = None
             print("Not using DinoV2")
-            hidden_size = 768  # DinoV2-base hidden size
+            hidden_size = 1024  # DinoV2-large hidden size
         
         self.adapter = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -173,6 +173,7 @@ class VisionEncoder(nn.Module):
         Returns:
             patch_embeds: (B, N, embedding_dim) normalized patch embeddings
         """
+        cached_features = cached_features.detach() 
         adapted = self.adapter(cached_features)  # (B, N+1, 768)
         patches = adapted[:, 1:]    # (B, N, 768) - skip CLS token
         patch_embeds = self.projection(patches)  # (B, N, embedding_dim)
@@ -221,10 +222,10 @@ class VeS(nn.Module):
         self.visual_embedder = VisionEncoder(use_cached_features=use_cached_visual_features)  
         self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960")
         self.use_cached_visual_features = use_cached_visual_features
-        self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
-        self.bias = nn.Parameter(torch.tensor(-10.0))
+        #self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
+        #self.bias = nn.Parameter(torch.tensor(-10.0))
 
-        #self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1/0.07))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.loss_type = loss_type
         assert self.loss_type in ["dense", "dense_global", "global"], "Invalid loss type"
@@ -366,7 +367,7 @@ class VeS(nn.Module):
         return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
 
 
-    
+    '''
     def compute_contrastive_loss(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor, audio_feats: torch.Tensor = None, visual_feats: torch.Tensor = None, global_weight: float = 0.0 ): #sigmoid
         """
         Pair-wise sigmoid contrastive loss for text-visual alignment.
@@ -410,7 +411,7 @@ class VeS(nn.Module):
 
         return total_loss, l_nonneg, l_tv, pairwise_loss, 0.0
     
-    '''
+    
     def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
         """ InfoNCE loss with regularization"""
         batch_size = clip_similarities.shape[0]
@@ -429,7 +430,7 @@ class VeS(nn.Module):
         total_loss = contrastive_loss + reg_loss
         return total_loss, l_nonneg, l_tv
     '''
-    '''
+    
     def compute_contrastive_loss(self, clip_sims, token_sims, attention_mask, audio_feats=None, visual_feats=None, global_weight=0.5):
         """ InfoNCE loss with regularization + optional global mean-pooled loss"""
         batch_size = clip_sims.shape[0]
@@ -470,7 +471,7 @@ class VeS(nn.Module):
         total_loss = contrastive_loss + reg_loss
         
         return total_loss, l_nonneg, l_tv, token_contrastive_loss, global_contrastive_loss
-    '''    
+    
         
     
     def forward(self, audio_input, images=None, attention_mask=None, cached_visual_features=None):

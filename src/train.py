@@ -488,7 +488,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 #   periodic visualisation
                 # ---------------------------------------------------------
-                if self.global_step % self.viz_every_steps == 0 and self.global_step != 0:
+                if self.global_step % self.viz_every_steps == 0:# and self.global_step != 0:
                     matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
@@ -589,8 +589,8 @@ if __name__ == "__main__":
         },
         "wandb": {
             "enabled": True,
-            "project": "fuckaroundlolz",
-            "name": "frozendino-0.1",
+            "project": "fuckaroundlol",
+            "name": "large-dino",
             "log_freq": 1, 
             "watch_model": False,  
         },
@@ -600,8 +600,8 @@ if __name__ == "__main__":
     # trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/Vaani")
     
     # Or without cached features (will compute from images):
-    #trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/CisStuff/cached_features/dinov2_base")
-    trainer = VeSTrainer(config, use_cached_visual_features=False)
+    trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/CisStuff/cached_features/dinov2_large")
+    #trainer = VeSTrainer(config, use_cached_visual_features=False)
     print("trainer initialized")
     
     # Automatically resume from the latest checkpoint if available
