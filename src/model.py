@@ -41,7 +41,7 @@ class AudioEmbedder(nn.Module):
             bias="none",
         )
 
-        self.hubert = get_peft_model(self.hubert, lora_cfg)
+        #self.hubert = get_peft_model(self.hubert, lora_cfg)
         self.hubert.gradient_checkpointing_enable()
 
         self.projection1 = nn.Linear(self.hubert.config.hidden_size, 256)
@@ -50,7 +50,10 @@ class AudioEmbedder(nn.Module):
         self.downsample_factor = self._compute_downsample_factor()
         print(f"Downsample factor: {self.downsample_factor}")
             
+        for param in self.hubert.parameters():
+            param.requires_grad = True
         # Projection always trainable 
+
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
@@ -220,7 +223,7 @@ class VeS(nn.Module):
         super().__init__()
 
         self.visual_embedder = VisionEncoder(use_cached_features=use_cached_visual_features)  
-        self.audio_embedder = AudioEmbedder(hubert_name="facebook/hubert-base-ls960")
+        self.audio_embedder = AudioEmbedder(hubert_name="ntu-spml/distilhubert") #facebook/hubert-base-ls960
         self.use_cached_visual_features = use_cached_visual_features
         #self.logit_scale = nn.Parameter(torch.tensor(math.log(10)))
         #self.bias = nn.Parameter(torch.tensor(-10.0))

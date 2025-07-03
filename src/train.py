@@ -418,15 +418,26 @@ class VeSTrainer:
             
             # Determine if we need to skip steps (for mid-epoch resume)
             steps_to_skip = 0
+            
+            # Only skip steps if we're resuming mid-epoch from a checkpoint
+            # This happens when current_epoch equals the epoch we're about to start
+            # AND we have a non-zero epoch_step (meaning we stopped mid-epoch)
             if epoch == self.current_epoch and self.epoch_step > 0:
                 steps_to_skip = self.epoch_step
-                print(f"Resuming from epoch {epoch}, skipping first {steps_to_skip} steps")
+                
+                # Safety check: if steps to skip is unreasonably high, don't skip
+                if steps_to_skip > 40000:
+                    print(f"WARNING: Steps to skip ({steps_to_skip}) exceeds 40k limit. Starting epoch {epoch} from beginning.")
+                    steps_to_skip = 0
+                    self.epoch_step = 0
+                else:
+                    print(f"Resuming from epoch {epoch}, skipping first {steps_to_skip} steps")
+            else:
+                # Starting a fresh epoch - reset epoch_step
+                self.epoch_step = 0
+                print(f"Starting fresh epoch {epoch}")
             
             pbar = tqdm(enumerate(epoch_dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
-            
-            # Reset epoch_step at the beginning of a new epoch
-            if epoch != self.current_epoch:
-                self.epoch_step = 0
 
             accumulation_counter = 0
             '''print("\n=== LoRA Parameter Verification ===")
@@ -565,11 +576,11 @@ if __name__ == "__main__":
             
             # Data settings
             "batch_size": 54,
-            "num_workers": 6, #12,
+            "num_workers": 8, #12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 3,
+            "num_epochs": 8,
             
             # Optimization
             "learning_rate": 3e-4,
@@ -577,10 +588,10 @@ if __name__ == "__main__":
             "warmup_ratio": 0.1,  
             
             # Checkpointing
-            "output_dir": "checkpoints",
+            "output_dir": "checkpoints-distilhubert",
             "checkpoint_every_steps": 20000,
             
-            "viz_every_steps": 2500,
+            "viz_every_steps": 5000,
             "viz_batch_limit": 32,
         },
         "logging": {
@@ -588,9 +599,9 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
+            "enabled": False,
             "project": "fuckaroundlol",
-            "name": "large-dino",
+            "name": "large-dino-distilhubert",
             "log_freq": 1, 
             "watch_model": False,  
         },

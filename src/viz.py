@@ -30,6 +30,9 @@ class VeSVisualizer:
         alpha: float = 0.9,                # heat-map opacity
         max_samples_per_call: int = 4,
         reduction: int = 2,
+        side_by_side: bool = True,         # Enable side-by-side layout
+        separator_width: int = 4,           # Width of separator line between images
+        label_height: int = 30,             # Height for text labels
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -39,6 +42,11 @@ class VeSVisualizer:
         self.reduction = reduction
         self.samples_per_token = 320 * reduction
         self.max_samples_per_call = max_samples_per_call
+        
+        # Side-by-side layout options
+        self.side_by_side = side_by_side
+        self.separator_width = separator_width
+        self.label_height = label_height
 
         # ImageNet mean / std for un-normalising
         self._mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -196,6 +204,52 @@ class VeSVisualizer:
         x1, y1, x2, y2 = crop_coords
         return frame[y1:y2, x1:x2]
 
+    def _create_side_by_side_frame(self, left_frame: np.ndarray, right_frame: np.ndarray) -> np.ndarray:
+        """
+        Create a side-by-side frame with labels and separator.
+        
+        Args:
+            left_frame: Original image frame (H, W, 3)
+            right_frame: Heatmap overlay frame (H, W, 3)
+            
+        Returns:
+            Combined frame with labels and separator
+        """
+        H, W, C = left_frame.shape
+        
+        # Create canvas with extra height for labels
+        total_width = W * 2 + self.separator_width
+        total_height = H + self.label_height
+        canvas = np.zeros((total_height, total_width, C), dtype=np.uint8)
+        
+        # Add frames to canvas (below labels)
+        canvas[self.label_height:, :W] = left_frame
+        canvas[self.label_height:, W + self.separator_width:] = right_frame
+        
+        # Add separator line
+        if self.separator_width > 0:
+            separator_color = (128, 128, 128)  # Gray separator
+            canvas[self.label_height:, W:W + self.separator_width] = separator_color
+        
+        # Add text labels
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.6
+        font_color = (255, 255, 255)
+        font_thickness = 2
+        
+        # "Original" label (left side)
+        text_size = cv2.getTextSize("Original", font, font_scale, font_thickness)[0]
+        text_x = (W - text_size[0]) // 2
+        text_y = self.label_height - 8
+        cv2.putText(canvas, "Original", (text_x, text_y), font, font_scale, font_color, font_thickness, cv2.LINE_AA)
+        
+        # "Heatmap" label (right side)
+        text_size = cv2.getTextSize("Heatmap", font, font_scale, font_thickness)[0]
+        text_x = W + self.separator_width + (W - text_size[0]) // 2
+        cv2.putText(canvas, "Heatmap", (text_x, text_y), font, font_scale, font_color, font_thickness, cv2.LINE_AA)
+        
+        return canvas
+
     # ---------------------------------------------------------------------
     #                       encode ONE sample to MP4
     # ---------------------------------------------------------------------
@@ -246,8 +300,14 @@ class VeSVisualizer:
 
         vstream = container.add_stream("libx264", rate=self.fps)
         vstream.pix_fmt = "yuv420p"
-        vstream.width = W
-        vstream.height = H
+        
+        # Set video dimensions based on layout mode
+        if self.side_by_side:
+            vstream.width = W * 2 + self.separator_width
+            vstream.height = H + self.label_height
+        else:
+            vstream.width = W
+            vstream.height = H
 
         astream = container.add_stream("aac", rate=int(sr))
         astream.layout = "mono"
@@ -260,7 +320,7 @@ class VeSVisualizer:
             # Apply cropping to remove black padding
             frame_np_cropped = self._apply_crop(frame_np, crop_coords)
 
-            # 🌱 timestamp overlay (bottom-left)
+            # 🌱 timestamp overlay (bottom-left of heatmap frame)
             ts_sec = t / self.fps
             cv2.putText(
                 frame_np_cropped,
@@ -273,12 +333,23 @@ class VeSVisualizer:
                 cv2.LINE_AA,
             )
 
-            # Collect frames for matplotlib
+            # Collect frames for matplotlib (clean heatmap overlay only)
             if t in frame_indices:
                 collected_frames.append(frame_np_cropped.copy())
                 collected_timestamps.append(ts_sec)
 
-            frame = av.VideoFrame.from_ndarray(frame_np_cropped, format="rgb24")
+            # Create final video frame based on layout mode
+            if self.side_by_side:
+                # Create original frame (cropped, no heatmap)
+                original_cropped = self._apply_crop(rgb_base, crop_coords)
+                
+                # Create side-by-side frame for video
+                video_frame = self._create_side_by_side_frame(original_cropped, frame_np_cropped)
+            else:
+                # Use the heatmap overlay frame as-is
+                video_frame = frame_np_cropped
+
+            frame = av.VideoFrame.from_ndarray(video_frame, format="rgb24")
             for pkt in vstream.encode(frame):
                 container.mux(pkt)
 
@@ -467,10 +538,12 @@ if __name__ == "__main__":
                           help="Image URL or local path")
         parser.add_argument("--output", type=str, default="test_viz", 
                           help="Output directory")
+        parser.add_argument("--side-by-side", action="store_true",
+                          help="Enable side-by-side layout with original image")
         args = parser.parse_args()
         
         # Create visualizer
-        viz = VeSVisualizer(out_dir=args.output, alpha=0.4)
+        viz = VeSVisualizer(out_dir=args.output, alpha=0.4, side_by_side=args.side_by_side)
         
         # Load image
         if args.image.startswith("http"):
@@ -538,7 +611,8 @@ if __name__ == "__main__":
         if frames:
             fig = viz._create_frame_plot(frames, timestamps, "test_heatmap")
             if fig is not None:
-                print(f"✅ Test visualization saved to {args.output}/")
+                layout_mode = "side-by-side" if args.side_by_side else "overlay"
+                print(f"✅ Test visualization saved to {args.output}/ ({layout_mode} mode)")
                 print(f"   Video: test_heatmap.mp4")
                 print(f"   Frames: test_heatmap_frames.png")
             else:
