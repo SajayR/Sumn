@@ -23,6 +23,10 @@ import pickle
 import bitsandbytes as bnb
 #from splus import SPlus
 from viz import VeSVisualizer
+import torch.multiprocessing as mp
+mp.set_start_method('fork', force=True)  # Explicit is better than implicit
+
+
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
 torch.cuda.set_per_process_memory_fraction(0.98) 
@@ -36,12 +40,14 @@ os.environ["TORCH_COMPILE_DEBUG"] = "1"
 class VeSTrainer:
     """Simple trainer for the VeS model with the VAANI paired dataset."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, use_cached_visual_features=False, cached_features_base_path=None):
         super().__init__()
 
         # ----------------------------- config -----------------------------
         self.cfg_train = config.get("training", {})
         self.cfg_wandb = config.get("wandb", {})
+        self.use_cached_visual_features = use_cached_visual_features
+        self.cached_features_base_path = cached_features_base_path
 
         self.device   = torch.device(
             self.cfg_train.get("device", "cuda" if torch.cuda.is_available() else "cpu")
@@ -81,7 +87,7 @@ class VeSTrainer:
         self.logger = logging.getLogger(__name__)
 
         self.cfg_data = config.get("data", {})
-        dataset = VAAPairedDataset()
+        dataset = VAAPairedDataset(cached_features_base_path=self.cached_features_base_path)
 
         # Create DataLoader with deterministic worker seeding
         def worker_init_fn(worker_id):
@@ -106,11 +112,11 @@ class VeSTrainer:
             shuffle=True,
             generator=self.data_generator, 
             worker_init_fn=worker_init_fn, 
-            pin_memory_device="cuda" 
+            #pin_memory_device="cuda" 
         )
         self.steps_per_epoch = len(self.dataloader)
         
-        self.model = VeS(loss_type="dense").to(self.device)
+        self.model = VeS(loss_type="dense", use_cached_visual_features=self.use_cached_visual_features).to(self.device)
         #self.model.visual_embedder.fuse_lora()
         #torch._dynamo.reset()
         #self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=False)#, fullgraph=True)#, dynamic=False)
@@ -347,10 +353,10 @@ class VeSTrainer:
                                if p.requires_grad and 'hubert' not in n)
         
         vision_base_params = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() 
-                                if p.requires_grad and 'lora_' not in n)
-        vision_base_params_frozen = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() if not p.requires_grad and 'lora_' not in n)
-        vision_lora_params = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() 
-                                if p.requires_grad and 'lora_' in n)
+                                if p.requires_grad and 'lora_' not in n ) if self.model.visual_embedder.model is not None else 0
+        vision_base_params_frozen = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() if not p.requires_grad and 'lora_' not in n) if self.model.visual_embedder.model is not None else 0
+        #vision_lora_params = sum(p.numel() for n, p in self.model.visual_embedder.model.named_parameters() 
+        #                        if p.requires_grad and 'lora_' in n)
         vision_proj_params = sum(p.numel() for n, p in self.model.visual_embedder.named_parameters() 
                                 if p.requires_grad and 'model' not in n)
         
@@ -366,7 +372,7 @@ class VeSTrainer:
         print(f"Audio Projections: {audio_proj_params:,} params (TRAINABLE)")
         print(f"Vision Base Model: {vision_base_params:,} params {'(WARNING: SHOULD BE FROZEN!)' if vision_base_params > 0 else '(FROZEN)'}")
         print(f"Vision Base Model Frozen: {vision_base_params_frozen:,} params (FROZEN)")
-        print(f"Vision LoRA: {vision_lora_params:,} params (TRAINABLE)")
+        #print(f"Vision LoRA: {vision_lora_params:,} params (TRAINABLE)")
         print(f"Vision Projections: {vision_proj_params:,} params (TRAINABLE)")
         print(f"Other (logit_scale, bias): {other_params:,} params (TRAINABLE)")
         print(f"Total Trainable: {total_trainable:,} / {total_params:,} ({100 * total_trainable / total_params:.2f}%)")
@@ -407,20 +413,31 @@ class VeSTrainer:
                 shuffle=True,
                 generator=self.data_generator,
                 worker_init_fn=epoch_worker_init_fn,
-                pin_memory_device="cuda"
+                #pin_memory_device="cuda"
             )
             
             # Determine if we need to skip steps (for mid-epoch resume)
             steps_to_skip = 0
+            
+            # Only skip steps if we're resuming mid-epoch from a checkpoint
+            # This happens when current_epoch equals the epoch we're about to start
+            # AND we have a non-zero epoch_step (meaning we stopped mid-epoch)
             if epoch == self.current_epoch and self.epoch_step > 0:
                 steps_to_skip = self.epoch_step
-                print(f"Resuming from epoch {epoch}, skipping first {steps_to_skip} steps")
+                
+                # Safety check: if steps to skip is unreasonably high, don't skip
+                if steps_to_skip > 40000:
+                    print(f"WARNING: Steps to skip ({steps_to_skip}) exceeds 40k limit. Starting epoch {epoch} from beginning.")
+                    steps_to_skip = 0
+                    self.epoch_step = 0
+                else:
+                    print(f"Resuming from epoch {epoch}, skipping first {steps_to_skip} steps")
+            else:
+                # Starting a fresh epoch - reset epoch_step
+                self.epoch_step = 0
+                print(f"Starting fresh epoch {epoch}")
             
             pbar = tqdm(enumerate(epoch_dataloader), total=self.steps_per_epoch, desc=f"Epoch {epoch}")
-            
-            # Reset epoch_step at the beginning of a new epoch
-            if epoch != self.current_epoch:
-                self.epoch_step = 0
 
             accumulation_counter = 0
             '''print("\n=== LoRA Parameter Verification ===")
@@ -441,12 +458,20 @@ class VeSTrainer:
                 if step >= self.steps_per_epoch:
                     break  # bound the epoch length for IterableDataset
 
-                audio  = batch["audio"].to(self.device, non_blocking=True)
-                images = batch["image"].to(self.device, non_blocking=True)
+                audio = batch["audio"].to(self.device, non_blocking=True)
+                attention_mask = batch["audio_attention_mask"].to(self.device, non_blocking=True)
                 
-                with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                    outputs = self.model(audio, images, attention_mask=batch["audio_attention_mask"].to(self.device))
-                    loss    = outputs["loss"] / self.gradient_accumulation
+                # Use cached visual features if available, otherwise use images
+                if "cached_visual_features" in batch:
+                    cached_features = batch["cached_visual_features"].to(self.device, non_blocking=False)
+                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        outputs = self.model(audio, attention_mask=attention_mask, cached_visual_features=cached_features)
+                else:
+                    images = batch["image"].to(self.device, non_blocking=True)
+                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        outputs = self.model(audio, images=images, attention_mask=attention_mask)
+                
+                loss = outputs["loss"] / self.gradient_accumulation
 
                 loss.backward()
                 #loss.detach()
@@ -474,7 +499,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 #   periodic visualisation
                 # ---------------------------------------------------------
-                if self.global_step % self.viz_every_steps == 0 and self.global_step != 0:
+                if self.global_step % self.viz_every_steps == 0:# and self.global_step != 0:
                     matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
@@ -505,6 +530,8 @@ class VeSTrainer:
                         "train/l_nonneg": outputs["l_nonneg"].item(),
                         "train/l_tv": outputs["l_tv"].item(),
                         "train/logit_scale": self.model.logit_scale.exp().item(),
+                        "train/clip_sims": outputs["clip_sims"].mean().item(),
+                        "train/clip_diagonal_sims": outputs["clip_sims"].diagonal().mean().item(),
                     }
                     if "dense_loss" in outputs:
                         to_log["train/dense_loss"] = outputs["dense_loss"].item()
@@ -549,11 +576,11 @@ if __name__ == "__main__":
             
             # Data settings
             "batch_size": 54,
-            "num_workers": 6, #12,
+            "num_workers": 8, #12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 3,
+            "num_epochs": 8,
             
             # Optimization
             "learning_rate": 3e-4,
@@ -561,10 +588,10 @@ if __name__ == "__main__":
             "warmup_ratio": 0.1,  
             
             # Checkpointing
-            "output_dir": "checkpoints",
+            "output_dir": "checkpoints-distilhubert",
             "checkpoint_every_steps": 20000,
             
-            "viz_every_steps": 2500,
+            "viz_every_steps": 5000,
             "viz_batch_limit": 32,
         },
         "logging": {
@@ -572,15 +599,20 @@ if __name__ == "__main__":
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": True,
-            "project": "VS-Rewamp",
-            "name": "frozendino-0.1",
+            "enabled": False,
+            "project": "fuckaroundlol",
+            "name": "large-dino-distilhubert",
             "log_freq": 1, 
             "watch_model": False,  
         },
     }
 
-    trainer = VeSTrainer(config)
+    # Example usage with cached features:
+    # trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/Vaani")
+    
+    # Or without cached features (will compute from images):
+    trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/CisStuff/cached_features/dinov2_large")
+    #trainer = VeSTrainer(config, use_cached_visual_features=False)
     print("trainer initialized")
     
     # Automatically resume from the latest checkpoint if available
