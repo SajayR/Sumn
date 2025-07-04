@@ -10,6 +10,7 @@ import torch.nn as nn
 import torchvision.transforms as transforms
 from model import VeS
 from data import VAAPairedDataset
+from retrieval import RetrievalEvaluator   # 🔥 NEW
 from transformers import AutoProcessor, get_cosine_schedule_with_warmup
 import numpy as np
 import matplotlib.pyplot as plt
@@ -61,6 +62,12 @@ class VeSTrainer:
         self.visualize_every_steps      = self.cfg_train.get("visualize_every_steps", 10)
         self.viz_every_steps            = self.cfg_train.get("viz_every_steps", 10)
         
+        # ──────────────────────────────────────────────────────────────
+        # Evaluation / retrieval-metric settings
+        # ──────────────────────────────────────────────────────────────
+        self.eval_every_steps        = self.cfg_train.get("eval_every_steps", 20_000)
+        self.eval_batch_size         = self.cfg_train.get("eval_batch_size", 32)
+        
         # Set deterministic seed for reproducible data ordering
         self.data_seed = self.cfg_train.get("data_seed", 42)
         self.set_seeds(self.data_seed)
@@ -87,7 +94,32 @@ class VeSTrainer:
         self.logger = logging.getLogger(__name__)
 
         self.cfg_data = config.get("data", {})
-        dataset = VAAPairedDataset(cached_features_base_path=self.cached_features_base_path)
+        dataset = VAAPairedDataset(
+            cached_features_base_path=self.cached_features_base_path
+        )
+
+        # Validation set — fixed 5 k rows -------------------------------------------------
+        self.val_dataset = VAAPairedDataset(
+            is_validation=True,
+            cached_features_base_path=self.cached_features_base_path
+        )
+        self.val_dataloader = DataLoader(
+            self.val_dataset,
+            batch_size=self.eval_batch_size,
+            num_workers=8,
+            pin_memory=True,
+            persistent_workers=True,
+            shuffle=False,
+            drop_last=False,
+        )
+        self.retrieval_evaluator = RetrievalEvaluator(
+            self.val_dataloader,
+            device=str(self.device),
+            batch_size=self.eval_batch_size,
+            logger=self.logger,
+            use_cached_embeddings=False,       # re-extract at every call
+            cache_dir=self.output_dir / "eval_cache"
+        )
 
         # Create DataLoader with deterministic worker seeding
         def worker_init_fn(worker_id):
@@ -543,6 +575,40 @@ class VeSTrainer:
                 if self.global_step % self.checkpoint_every_steps == 0 and self.global_step != 0:
                     self.save_checkpoint(epoch, self.global_step, step + 1)
 
+                # ──────────────────────────────────────
+                #  periodic retrieval evaluation
+                # ──────────────────────────────────────
+                if (
+                    self.global_step % self.eval_every_steps == 0
+                    #and self.global_step != 0
+                ):
+                    #  make current step visible to evaluator for caching
+                    self.model.global_step = self.global_step
+
+                    self.logger.info(
+                        f"🔍 Running retrieval eval @ step {self.global_step}..."
+                    )
+
+                    eval_results = self.retrieval_evaluator.evaluate(
+                        self.model,
+                        max_samples=None,          # full 5 k subset
+                        log_to_wandb=self.use_wandb,
+                        global_step=self.global_step,
+                    )
+
+                    # pretty console summary
+                    for agg_name, dirs in eval_results.items():
+                        a2v = dirs["audio_to_visual"]
+                        v2a = dirs["visual_to_audio"]
+                        self.logger.info(
+                            f"[{agg_name}]  "
+                            f"A2V-R@1 {a2v.r1:4.1f}  "
+                            f"V2A-R@1 {v2a.r1:4.1f}"
+                        )
+
+                    torch.cuda.empty_cache()
+                    self.model.train()   # switch back to training mode
+
                 self.global_step += 1
                 self.epoch_step = step + 1  # Track current step within epoch
 
@@ -591,15 +657,20 @@ if __name__ == "__main__":
             "output_dir": "checkpoints-distilhubert",
             "checkpoint_every_steps": 20000,
             
+            # Visualization
             "viz_every_steps": 5000,
             "viz_batch_limit": 32,
+            
+            # Evaluation
+            "eval_every_steps": 20000,
+            "eval_batch_size": 32,
         },
         "logging": {
             "level": "INFO",
             "log_file": "training.log",
         },
         "wandb": {
-            "enabled": False,
+            "enabled": True,
             "project": "fuckaroundlol",
             "name": "large-dino-distilhubert",
             "log_freq": 1, 
