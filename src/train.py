@@ -30,7 +30,7 @@ mp.set_start_method('fork', force=True)  # Explicit is better than implicit
 
 warnings.filterwarnings("ignore")
 torch.cuda.empty_cache()
-torch.cuda.set_per_process_memory_fraction(0.98) 
+#torch.cuda.set_per_process_memory_fraction(0.98) 
 torch.compiler.reset()  
 #torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -566,7 +566,7 @@ class VeSTrainer:
                         "train/clip_diagonal_sims": outputs["clip_sims"].diagonal().mean().item(),
                     }
                     if "dense_loss" in outputs:
-                        to_log["train/dense_loss"] = outputs["dense_loss"].item()
+                        to_log["train/dense_loss"] = outputs["dense_loss"].item() if isinstance(outputs["dense_loss"], torch.Tensor) else outputs["dense_loss"]
                     if "global_loss" in outputs:
                         to_log["train/global_loss"] = outputs["global_loss"].item() if isinstance(outputs["global_loss"], torch.Tensor) else outputs["global_loss"]
                     wandb.log(to_log, step=self.global_step)
@@ -654,7 +654,7 @@ if __name__ == "__main__":
             "warmup_ratio": 0.1,  
             
             # Checkpointing
-            "output_dir": "checkpoints-distilhubert",
+            "output_dir": "checkpoints-denseloss-oneway",
             "checkpoint_every_steps": 20000,
             
             # Visualization
@@ -672,7 +672,7 @@ if __name__ == "__main__":
         "wandb": {
             "enabled": True,
             "project": "fuckaroundlol",
-            "name": "large-dino-distilhubert",
+            "name": "denseloss-oneway",
             "log_freq": 1, 
             "watch_model": False,  
         },

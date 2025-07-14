@@ -221,12 +221,13 @@ class RetrievalEvaluator:
         a2v_clip = a2v_sum / valid_a  # (B1, B2)
         
         # Visual -> Audio: max over tokens, mean over patches
-        v2a_max = masked_sims.max(dim=2).values  # (B1, B2, Nv)
-        v2a_max = torch.where(torch.isinf(v2a_max), torch.zeros_like(v2a_max), v2a_max)
-        v2a_clip = v2a_max.mean(dim=2)  # (B1, B2)
+        #v2a_max = masked_sims.max(dim=2).values  # (B1, B2, Nv)
+        #v2a_max = torch.where(torch.isinf(v2a_max), torch.zeros_like(v2a_max), v2a_max)
+        #v2a_clip = v2a_max.mean(dim=2)  # (B1, B2)
         
         # Average both directions
-        clip_sims = 0.5 * (a2v_clip + v2a_clip)
+        #clip_sims = 0.5 * (a2v_clip + v2a_clip)
+        clip_sims = a2v_clip
         
         return clip_sims
     

@@ -303,11 +303,12 @@ class VeS(nn.Module):
         a2v_clip = a2v_sum / valid_a                                # (B, B)
 
         # 2) visual → audio • max over tokens, mean over patches  
-        v2a_max = masked_token_sims.max(dim=2).values               # (B, B, Nv)
-        v2a_max = torch.where(torch.isinf(v2a_max), torch.zeros_like(v2a_max), v2a_max)
-        v2a_clip = v2a_max.mean(dim=2)                              # (B, B)
+        #v2a_max = masked_token_sims.max(dim=2).values               # (B, B, Nv)
+        #v2a_max = torch.where(torch.isinf(v2a_max), torch.zeros_like(v2a_max), v2a_max)
+        #v2a_clip = v2a_max.mean(dim=2)                              # (B, B)
 
-        clip_sims = 0.5 * (a2v_clip + v2a_clip)                     # (B, B)
+        #clip_sims = 0.5 * (a2v_clip + v2a_clip)                     # (B, B)
+        clip_sims = a2v_clip
         clip_sims = clip_sims * self.logit_scale.exp().clamp(max=100)
 
         return clip_sims, token_sims
@@ -437,9 +438,9 @@ class VeS(nn.Module):
     def compute_contrastive_loss(self, clip_sims, token_sims, attention_mask, audio_feats=None, visual_feats=None, global_weight=0.5):
         """ InfoNCE loss with regularization + optional global mean-pooled loss"""
         batch_size = clip_sims.shape[0]
+        labels = torch.arange(batch_size).to(clip_sims.device)
         if self.loss_type == "dense" or self.loss_type == "dense_global":
             # Existing token-level loss
-            labels = torch.arange(batch_size).to(clip_sims.device)
             # Audio to Visual direction
             log_prob_a2v = F.log_softmax(clip_sims, dim=1)
             losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
@@ -549,7 +550,7 @@ class VeS(nn.Module):
             'token_sims': token_sims.detach(),
             'l_nonneg': l_nonneg.detach(),
             'l_tv': l_tv.detach(),
-            'dense_loss': dense_loss.detach(),
+            'dense_loss': dense_loss.detach() if isinstance(dense_loss, torch.Tensor) else dense_loss,  
             'global_loss': global_loss.detach() if isinstance(global_loss, torch.Tensor) else global_loss
         }
 

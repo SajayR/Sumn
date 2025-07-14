@@ -15,3 +15,10 @@ requirements.txt
 src/utils/
 viz.ipynb
 ssddataset/
+*.wav
+src/checkpoints*
+src/wandb*
+*test*
+test_viz/
+torch_compile_debug/
+vaani_data/
