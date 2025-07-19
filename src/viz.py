@@ -404,7 +404,7 @@ class VeSVisualizer:
         
         # Save the figure
         plot_path = self.out_dir / f"{basename}_frames.png"
-        fig.savefig(plot_path, dpi=150, bbox_inches='tight')
+        #fig.savefig(plot_path, dpi=150, bbox_inches='tight')
         
         return fig
 
@@ -421,10 +421,46 @@ class VeSVisualizer:
         outputs – dict coming out of model.forward(); MUST include
                   "token_sims" (B,B,Na,Nv)
         """
+        # Handle crop_info first - handle various possible structures from DataLoader
+        crop_infos = []
+        if "crop_info" in batch:
+            raw_crop_infos = batch["crop_info"]
+            
+            # Handle different possible structures
+            if isinstance(raw_crop_infos, list):
+                # Expected case: list of crop_info dicts
+                crop_infos = raw_crop_infos
+            elif isinstance(raw_crop_infos, dict):
+                # If DataLoader somehow batched the dict fields
+                # Extract each sample's crop_info
+                batch_size = len(batch["image_path"]) if "image_path" in batch else len(batch["image"])
+                for i in range(batch_size):
+                    try:
+                        sample_crop_info = {}
+                        for k, v in raw_crop_infos.items():
+                            if isinstance(v, (list, tuple)):
+                                sample_crop_info[k] = v[i]
+                            elif hasattr(v, '__getitem__') and hasattr(v, 'shape') and len(v.shape) > 0:
+                                # Handle PyTorch tensors and similar array-like objects
+                                sample_crop_info[k] = v[i]
+                            else:
+                                # Scalar value, same for all samples
+                                sample_crop_info[k] = v
+                        crop_infos.append(sample_crop_info)
+                    except (IndexError, KeyError):
+                        crop_infos.append(None)
+            else:
+                # Fallback: fill with None
+                batch_size = len(batch["image_path"]) if "image_path" in batch else len(batch["image"])
+                crop_infos = [None] * batch_size
+        else:
+            # Fallback: fill with None if no crop_info
+            batch_size = len(batch["image_path"]) if "image_path" in batch else len(batch["image"])
+            crop_infos = [None] * batch_size
+
         if "image" not in batch:  # Using cached features, need to load images
             # Load images from paths for visualization
             image_paths = batch["image_path"]  # List of paths
-            crop_infos = batch["crop_info"]
             
             imgs = []
             for i, img_path in enumerate(image_paths):
@@ -436,8 +472,23 @@ class VeSVisualizer:
                 
                 # Apply the same crop strategy that was used during training
                 # (but without augmentations)
-                crop_strategy = crop_infos[i]["crop_strategy"] if i < len(crop_infos) else "pad_square"
-                target_size = crop_infos[i]["target_size"] if i < len(crop_infos) else 224
+                crop_info = crop_infos[i] if i < len(crop_infos) and crop_infos[i] is not None else {}
+                
+                # Extract and convert values to scalars
+                crop_strategy = crop_info.get("crop_strategy", "pad_square")
+                target_size = crop_info.get("target_size", 224)
+                
+                # Convert crop_strategy to string if it's a tensor/bytes
+                if hasattr(crop_strategy, 'item'):
+                    crop_strategy = crop_strategy.item()
+                elif isinstance(crop_strategy, bytes):
+                    crop_strategy = crop_strategy.decode('utf-8')
+                
+                # Convert target_size to int if it's a tensor
+                if hasattr(target_size, 'item'):
+                    target_size = int(target_size.item())
+                else:
+                    target_size = int(target_size)
                 
                 if crop_strategy == "pad_square":
                     width, height = image.size
@@ -469,30 +520,6 @@ class VeSVisualizer:
         sr     = batch["sampling_rate"]                     # list[int] or int
         attn   = outputs["audio_attention_mask"].cpu()        # (B,Na)
         sims   = outputs["token_sims"].cpu()                # (B,B,Na,Nv)
-        # Handle crop_info - handle various possible structures from DataLoader
-        crop_infos = []
-        if "crop_info" in batch:
-            raw_crop_infos = batch["crop_info"]
-            
-            # Handle different possible structures
-            if isinstance(raw_crop_infos, list):
-                # Expected case: list of crop_info dicts
-                crop_infos = raw_crop_infos
-            elif isinstance(raw_crop_infos, dict):
-                # If DataLoader somehow batched the dict fields
-                # Extract each sample's crop_info
-                batch_size = imgs.size(0)
-                for i in range(batch_size):
-                    try:
-                        sample_crop_info = {k: v[i] if isinstance(v, (list, tuple)) else v for k, v in raw_crop_infos.items()}
-                        crop_infos.append(sample_crop_info)
-                    except (IndexError, KeyError):
-                        crop_infos.append(None)
-            else:
-                # Fallback: fill with None
-                crop_infos = [None] * imgs.size(0)
-        else:
-            crop_infos = [None] * imgs.size(0)
 
         # Convert sr to per-sample list
         if isinstance(sr, int):
@@ -512,7 +539,7 @@ class VeSVisualizer:
                 sr=sr[i],
                 basename=basename,
                 attn_mask=attn[i],
-                crop_info=crop_infos[i] if isinstance(crop_infos, list) else crop_infos,
+                crop_info=crop_infos[i] if i < len(crop_infos) else None,
                 sample_idx=i,
             )
             

@@ -369,71 +369,6 @@ class VeS(nn.Module):
             l_tv = relative_diffs.mean()
 
         return l_nonneg + self.tv_weight * l_tv, l_nonneg, l_tv * self.tv_weight
-
-
-    '''
-    def compute_contrastive_loss(self, clip_sims: torch.Tensor, token_sims: torch.Tensor, attention_mask: torch.Tensor, audio_feats: torch.Tensor = None, visual_feats: torch.Tensor = None, global_weight: float = 0.0 ): #sigmoid
-        """
-        Pair-wise sigmoid contrastive loss for text-visual alignment.
-        Algorithm 1 Sigmoid loss pseudo-implementation.
-            1 # img_emb : image model embedding [n, dim]
-            2 # txt_emb : text model embedding [n, dim]
-            3 # t_prime, b : learnable temperature and bias
-            4 # n : mini-batch size
-            5
-            6 t = exp(t_prime)
-            7 zimg = l2_normalize(img_emb)
-            8 ztxt = l2_normalize(txt_emb)
-            9 logits = dot(zimg, ztxt.T) * t + b
-            10 labels = 2 * eye(n) - ones(n) # -1 with diagonal 1
-            11 l = -sum(log_sigmoid(labels * logits)) / n
-
-        Parameters
-        ----------
-        clip_sims : (B, B)   cosine-similarity matrix between every text in the batch
-                            and every image in the batch (higher = more similar)
-        token_sims: (B, B, Nt, Nv) token-level similarity tensor (needed only for the
-                    regularisation term carried over from the original code)
-
-        Returns
-        -------
-        total_loss        : scalar torch tensor
-        similarity_stats  : dict of useful monitoring statistics
-        """
-        B = clip_sims.size(0)
-        labels = torch.eye(B, device=clip_sims.device) * 2 - 1  # +1 on diag,  elsewhere
-        logits        = clip_sims + self.bias      # broadcast learnable bias b
-        pairwise_loss = -F.logsigmoid(labels * logits).mean()
-
-        #scaling loss for bf16 stability (if needed later)
-        #pairwise_loss = pairwise_loss * 10
-
-        # optional regularisation (unchanged from the original implementation)
-        reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)
-
-        total_loss = pairwise_loss + reg_loss
-
-        return total_loss, l_nonneg, l_tv, pairwise_loss, 0.0
-    
-    
-    def compute_contrastive_loss(self, clip_similarities, token_sims, attention_mask):
-        """ InfoNCE loss with regularization"""
-        batch_size = clip_similarities.shape[0]
-        
-        
-        labels = torch.arange(batch_size).to(clip_similarities.device)
-        # Audio to Visual direction
-        log_prob_a2v = F.log_softmax(clip_similarities, dim=1)
-        losses_a2v = -log_prob_a2v[torch.arange(batch_size), labels]
-        # Visual to Audio direction  
-        log_prob_v2a = F.log_softmax(clip_similarities.t(), dim=1)
-        losses_v2a = -log_prob_v2a[torch.arange(batch_size), labels]
-        # Average both directions
-        contrastive_loss = (losses_a2v + losses_v2a).mean() / 2
-        reg_loss, l_nonneg, l_tv = self.compute_regularization_losses_tv(token_sims, attention_mask)    
-        total_loss = contrastive_loss + reg_loss
-        return total_loss, l_nonneg, l_tv
-    '''
     
     def compute_contrastive_loss(self, clip_sims, token_sims, attention_mask, audio_feats=None, visual_feats=None, global_weight=0.5):
         """ InfoNCE loss with regularization + optional global mean-pooled loss"""
@@ -476,8 +411,6 @@ class VeS(nn.Module):
         
         return total_loss, l_nonneg, l_tv, token_contrastive_loss, global_contrastive_loss
     
-        
-    
     def forward(self, audio_input, images=None, attention_mask=None, cached_visual_features=None):
         """
         Forward pass of VeS model.
@@ -500,7 +433,7 @@ class VeS(nn.Module):
         if cached_visual_features is not None:
             visual_feats = self.visual_embedder(cached_features=cached_visual_features)
         elif images is not None:
-            print("Cached features not provided, using images")
+            #print("Cached features not provided, using images")
             visual_feats = self.visual_embedder(images)
         else:
             raise ValueError("Either images or cached_visual_features must be provided")

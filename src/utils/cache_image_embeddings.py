@@ -53,18 +53,18 @@ def collate_fn(batch):
     return images, paths
 
 def extract_dino_features(
-    unique_images_path="/speedy/CisStuff/dataset/unique_images.txt",
-    data_base_path="/speedy/Vaani", 
-    output_base_path="/speedy/CisStuff/cached_features/dinov2_base",
+    unique_images_path="unique_images.txt",
+    data_base_path="/workspace/vaani_data", 
+    output_base_path="/workspace/cached_features/dinov2_large",
     batch_size=128,
     skip_existing=True,
     num_workers=None
 ):
     if num_workers is None:
-        num_workers = 12#os.cpu_count()
+        num_workers = 8#os.cpu_count()
 
     # Load the model once
-    model = AutoModel.from_pretrained('facebook/dinov2-base').cuda()
+    model = AutoModel.from_pretrained('facebook/dinov2-large').cuda()
     model.eval()
     
     # Your standard transform WITHOUT augmentations
