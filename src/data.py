@@ -17,7 +17,7 @@ import torchaudio
 import torchaudio.transforms as T
 from transformers import AutoProcessor
 from pathlib import Path
-
+import time
 def process_image(image_path, crop_strategy="pad_square", target_size=224, use_augmentations=True):
     """
     Args:
@@ -112,14 +112,15 @@ def process_image(image_path, crop_strategy="pad_square", target_size=224, use_a
 class VAAPairedDataset(torch.utils.data.Dataset):
     
     def __init__(self, 
-                 json_dir_path="/speedy/CisStuff/VeS/vaani_data",  # Now it's a directory!
-                 data_base_path="/speedy/Vaani",
+                 json_dir_path="/workspace/vaani_jsons",  # Now it's a directory!
+                 data_base_path="/workspace/vaani_data",
                  crop_strategy="pad_square", 
                  target_size=224,
                  max_audio_duration=5.0,
                  sampling_rate=16000,
                  debug=False,
-                 cached_features_base_path=None,
+                 cached_features_base_path="/workspace/cached_features/dinov2_large",
+                 cached_image_tensors_path="/workspace/cached_tensors/images",
                  is_validation=False):  # Add this to know which JSONs to load
         super().__init__()
         
@@ -132,6 +133,7 @@ class VAAPairedDataset(torch.utils.data.Dataset):
         self.processor = AutoProcessor.from_pretrained("facebook/hubert-large-ls960-ft")
         
         # Cached features setup
+        self.cached_image_tensors_path = Path(cached_image_tensors_path) if cached_image_tensors_path else None
         self.cached_features_base_path = cached_features_base_path
         if cached_features_base_path is not None:
             print(f"Using cached visual features from: {cached_features_base_path}")
@@ -186,10 +188,11 @@ class VAAPairedDataset(torch.utils.data.Dataset):
             
             # The files should exist since you validated them, but just in case...
             if not audio_path.exists() or not image_path.exists():
-                print(f"Warning: Missing files for idx {idx}")
-                return self.__getitem__((idx + 1) % len(self))
+                    print(f"Warning: Missing files for idx {idx}")
+                    return self.__getitem__((idx + 1) % len(self))
             
             # Load and process audio (same as before)
+            #audio_start_time = time.time()
             waveform, sr = torchaudio.load(str(audio_path))
             
             if waveform.shape[0] > 1:
@@ -220,11 +223,12 @@ class VAAPairedDataset(torch.utils.data.Dataset):
             
             audio_tensor = processed.input_values.squeeze(0)
             attention_mask = processed.attention_mask.squeeze(0)
-            
+            #audio_end_time = time.time()
+            #print(f"Audio processing time: {audio_end_time - audio_start_time} seconds")
             # Check for cached visual features
             cached_features = None
             use_cached = False
-            
+            #cached_features_start_time = time.time()
             if self.cached_features_base_path is not None:
                 cache_base = Path(self.cached_features_base_path)
                 pt_filename = image_file.replace('.jpg', '.pt').replace('.jpeg', '.pt').replace('.png', '.pt')
@@ -237,25 +241,65 @@ class VAAPairedDataset(torch.utils.data.Dataset):
                     except Exception as e:
                         print(f"Warning: Failed to load cached features from {pt_path}: {e}")
                         use_cached = False
-            
+            #cached_features_end_time = time.time()
+            #print(f"Cached features processing time: {cached_features_end_time - cached_features_start_time} seconds")
             # Process image
             use_augmentations = not use_cached
-            image_tensor, crop_info = process_image(str(image_path), self.crop_strategy, 
-                                                    self.target_size, use_augmentations)
+
+            crop_info = None
+            if self.cached_image_tensors_path:
+                tensor_file = image_file.replace('.jpg', '.pt').replace('.jpeg', '.pt').replace('.png', '.pt')
+                tensor_path = self.cached_image_tensors_path / tensor_file
+                
+                if tensor_path.exists():
+                    try:
+                        # Load ONLY to get crop_info, not the tensor!
+                        cached_data = torch.load(tensor_path, map_location='cpu')
+                        crop_info = cached_data['crop_info']
+                    except:
+                        print(f"Warning: Failed to load cached image tensors from {tensor_path}")
+                        pass
             
-            result = {
-                "audio": audio_tensor,
-                "audio_attention_mask": attention_mask,
-                "sampling_rate": self.sampling_rate,
-                "image": image_tensor,
-                "audio_path": str(audio_path),
-                "image_path": str(image_path),
-                "crop_info": crop_info,
-                "using_cached_features": use_cached
-            }
+            # Fallback crop_info if not found
+            if crop_info is None:
+                print(f"Warning: Missing crop info for idx {idx}")
+                return self.__getitem__((idx + 1) % len(self))
+                
             
             if use_cached and cached_features is not None:
-                result["cached_visual_features"] = cached_features
+                # Using cached embeddings - don't load image!
+                result = {
+                    "audio": audio_tensor,
+                    "audio_attention_mask": attention_mask,
+                    "sampling_rate": self.sampling_rate,
+                    # NO "image" key! This tells model to use cached features
+                    # and tells visualizer to load from path
+                    "image_path": str(image_path),
+                    "audio_path": str(audio_path),
+                    "crop_info": crop_info,
+                    "using_cached_features": True,
+                    "cached_visual_features": cached_features  # The embeddings!
+                }
+            else:
+                # No cached embeddings - must load and process image
+                use_augmentations = True
+                image_tensor, crop_info = process_image(
+                    str(image_path), 
+                    self.crop_strategy,
+                    self.target_size, 
+                    use_augmentations
+                )
+                
+                result = {
+                    "audio": audio_tensor,
+                    "audio_attention_mask": attention_mask,
+                    "sampling_rate": self.sampling_rate,
+                    "image": image_tensor,  # Include actual image
+                    "image_path": str(image_path),
+                    "audio_path": str(audio_path),
+                    "crop_info": crop_info,
+                    "using_cached_features": False
+                }
             
             return result
             

@@ -136,19 +136,19 @@ class VeSTrainer:
         self.dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size,
-            num_workers=10,
+            num_workers=12,
             pin_memory=True,
-            persistent_workers=True,
+            #persistent_workers=True,
             drop_last=True,
-            #prefetch_factor=6,
+            prefetch_factor=4,
             shuffle=True,
             generator=self.data_generator, 
             worker_init_fn=worker_init_fn, 
-            #pin_memory_device="cuda" 
+            pin_memory_device="cuda" 
         )
         self.steps_per_epoch = len(self.dataloader)
         
-        self.model = VeS(loss_type="dense", use_cached_visual_features=self.use_cached_visual_features).to(self.device)
+        self.model = VeS(loss_type="global", use_cached_visual_features=self.use_cached_visual_features).to(self.device)
         #self.model.visual_embedder.fuse_lora()
         #torch._dynamo.reset()
         #self.model = torch.compile(self.model, mode="reduce-overhead", dynamic=False)#, fullgraph=True)#, dynamic=False)
@@ -531,7 +531,7 @@ class VeSTrainer:
                 # ---------------------------------------------------------
                 #   periodic visualisation
                 # ---------------------------------------------------------
-                if self.global_step % self.viz_every_steps == 0:# and self.global_step != 0:
+                if self.global_step % self.viz_every_steps == 0 and self.global_step != 0:
                     matplotlib_figures = self.visualizer.visualize_batch(
                         batch,                       
                         outputs,
@@ -545,7 +545,7 @@ class VeSTrainer:
                             wandb_images[f"heatmaps/{basename}"] = wandb.Image(fig)
                             plt.close(fig)  # Free memory
                         
-                        wandb.log(wandb_images, step=self.global_step)
+                        #wandb.log(wandb_images, step=self.global_step)
 
                 loss_val = loss.item() * self.gradient_accumulation
                 epoch_losses.append(loss_val)
@@ -580,7 +580,7 @@ class VeSTrainer:
                 # ──────────────────────────────────────
                 if (
                     self.global_step % self.eval_every_steps == 0
-                    #and self.global_step != 0
+                    and self.global_step != 0
                 ):
                     #  make current step visible to evaluator for caching
                     self.model.global_step = self.global_step
@@ -641,24 +641,24 @@ if __name__ == "__main__":
             "use_amp": True,
             
             # Data settings
-            "batch_size": 54,
+            "batch_size": 92,
             "num_workers": 8, #12,
             "data_seed": 42,  # Fixed seed for deterministic data ordering
             
             # Training schedule
-            "num_epochs": 8,
+            "num_epochs": 5,
             
             # Optimization
             "learning_rate": 3e-4,
-            "gradient_accumulation_steps": 4,
+            "gradient_accumulation_steps": 2,
             "warmup_ratio": 0.1,  
             
             # Checkpointing
-            "output_dir": "checkpoints-denseloss-oneway",
+            "output_dir": "checkpoints-global-loss",
             "checkpoint_every_steps": 20000,
             
             # Visualization
-            "viz_every_steps": 5000,
+            "viz_every_steps": 40000,
             "viz_batch_limit": 32,
             
             # Evaluation
@@ -671,8 +671,8 @@ if __name__ == "__main__":
         },
         "wandb": {
             "enabled": True,
-            "project": "fuckaroundlol",
-            "name": "denseloss-oneway",
+            "project": "VeS",
+            "name": "global-loss",
             "log_freq": 1, 
             "watch_model": False,  
         },
@@ -682,7 +682,7 @@ if __name__ == "__main__":
     # trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/Vaani")
     
     # Or without cached features (will compute from images):
-    trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/speedy/CisStuff/cached_features/dinov2_large")
+    trainer = VeSTrainer(config, use_cached_visual_features=True, cached_features_base_path="/workspace/cached_features/dinov2_large")
     #trainer = VeSTrainer(config, use_cached_visual_features=False)
     print("trainer initialized")
     
